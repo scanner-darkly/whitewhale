@@ -36,6 +36,9 @@
 	
 
 #define FIRSTRUN_KEY 0x22
+#define ARC_PAGE_FADER 0
+#define ARC_PAGE_PHASE 1
+#define ARC_PAGE_SETTINGS 2
 
 
 const u16 SCALES[24][16] = {
@@ -112,6 +115,11 @@ whale_set w;
 u8 preset_mode, preset_select, front_timer;
 u8 glyph[8];
 
+u8 is_arc_mode, arc_page = ARC_PAGE_PHASE;
+s16 encoder_delta[4] = {0, 0, 0, 0};
+u8 clock_phaseB;
+s8 posB, next_posB, pos_shift, step_shift;
+
 edit_modes edit_mode;
 u8 edit_cv_step, edit_cv_ch;
 s8 edit_cv_value;
@@ -160,7 +168,11 @@ static void refresh_256(void);
 static void refresh_mono(void);
 static void refresh_mono_256(void);
 static void refresh_preset(void);
+static void refresh_arc(void);
 static void clock(u8 phase);
+void clock_arc(u8 phase, bool is_clock_A);
+void arc_setup(void);
+void arc_cleanup(void);
 
 // start/stop monome polling/refresh timers
 extern void timers_set_monome(void);
@@ -193,6 +205,11 @@ void flash_read(void);
 // application clock code
 
 void clock(u8 phase) {
+    if (is_arc_mode) {
+        clock_arc(phase, true);
+        return;
+    }
+    
 	static u8 i1, count;
 	static u16 found[16];
 
@@ -459,12 +476,85 @@ void clock(u8 phase) {
 	// print_dbg_ulong(pos);
 }
 
-
+void clock_arc(u8 phase, bool is_clock_A) {
+    if (phase) {
+        if (is_clock_A) {
+            pos = next_pos;
+            if(pos >= w.wp[pattern].loop_end) next_pos = w.wp[pattern].loop_start;
+			else if(pos >= LENGTH) next_pos = 0;
+			else next_pos++;
+            
+            cv0 = w.wp[pattern].cv_curves[0][pos];
+            spi_selectChip(SPI,DAC_SPI);
+            spi_write(SPI,0x31);	// update A
+            spi_write(SPI,cv0>>4);
+            spi_write(SPI,cv0<<4);
+            spi_unselectChip(SPI,DAC_SPI);
+            
+            triggered = w.wp[pattern].steps[pos];
+			if(w.wp[pattern].tr_mode == 0) {
+				if(triggered & 0x1 && w.tr_mute[0]) gpio_set_gpio_pin(B00);
+				if(triggered & 0x2 && w.tr_mute[1]) gpio_set_gpio_pin(B01);
+			} else {
+				if(w.tr_mute[0]) {
+					if(triggered & 0x1) gpio_set_gpio_pin(B00);
+					else gpio_clr_gpio_pin(B00);
+				}
+				if(w.tr_mute[1]) {
+					if(triggered & 0x2) gpio_set_gpio_pin(B01);
+					else gpio_clr_gpio_pin(B01);
+				}
+			}
+        } else {
+            posB = next_posB;
+            if(posB >= w.wp[pattern].loop_end) next_posB = w.wp[pattern].loop_start;
+			else if(posB >= LENGTH) next_posB = 0;
+			else next_posB++;
+            
+            gpio_set_gpio_pin(B10);
+            cv1 = w.wp[pattern].cv_curves[1][posB];
+            spi_selectChip(SPI,DAC_SPI);
+            spi_write(SPI,0x38);	// update B
+            spi_write(SPI,cv1>>4);
+            spi_write(SPI,cv1<<4);
+            spi_unselectChip(SPI,DAC_SPI);
+            
+            triggered = w.wp[pattern].steps[posB];
+			if(w.wp[pattern].tr_mode == 0) {
+				if(triggered & 0x4 && w.tr_mute[2]) gpio_set_gpio_pin(B02);
+				if(triggered & 0x8 && w.tr_mute[3]) gpio_set_gpio_pin(B03);
+			} else {
+				if(w.tr_mute[2]) {
+					if(triggered & 0x4) gpio_set_gpio_pin(B02);
+					else gpio_clr_gpio_pin(B02);
+				}
+				if(w.tr_mute[3]) {
+					if(triggered & 0x8) gpio_set_gpio_pin(B03);
+					else gpio_clr_gpio_pin(B03);
+				}
+			}
+        }
+    } else {
+        if (is_clock_A) {
+            if(w.wp[pattern].tr_mode == 0) {
+                gpio_clr_gpio_pin(B00);
+                gpio_clr_gpio_pin(B01);
+            }
+        } else {
+            gpio_clr_gpio_pin(B10);
+            if(w.wp[pattern].tr_mode == 0) {
+                gpio_clr_gpio_pin(B02);
+                gpio_clr_gpio_pin(B03);
+            }
+        }
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 // timers
 
 static softTimer_t clockTimer = { .next = NULL, .prev = NULL };
+static softTimer_t clockTimerB = { .next = NULL, .prev = NULL };
 static softTimer_t keyTimer = { .next = NULL, .prev = NULL };
 static softTimer_t adcTimer = { .next = NULL, .prev = NULL };
 static softTimer_t monomePollTimer = { .next = NULL, .prev = NULL };
@@ -483,6 +573,13 @@ static void clockTimer_callback(void* o) {
 		clock_phase++;
 		if(clock_phase>1) clock_phase=0;
 		(*clock_pulse)(clock_phase);
+	}
+}
+
+static void clockTimerB_callback(void* o) {  
+	if(clock_external == 0 && is_arc_mode) {
+		clock_phaseB ^= 1;
+		clock_arc(clock_phaseB, false);
 	}
 }
 
@@ -569,12 +666,36 @@ static void handler_MonomeConnect(s32 data) {
 	// monome_set_quadrant_flag(0);
 	// monome_set_quadrant_flag(1);
 	timers_set_monome();
+    is_arc_mode = monome_device() == eDeviceArc;
+    if (is_arc_mode) arc_setup(); else arc_cleanup();
+}
+
+void arc_setup(void) {
+    LENGTH = 15;
+
+    clockTimerB.ticks = clockTimer.ticks;
+    clockTimerB.ticksRemain = clockTimer.ticksRemain;
+
+    u8 len = w.wp[pattern].loop_end - w.wp[pattern].loop_start + 1;
+    clock_phaseB = clock_phase;
+    if (pos_shift > 0) {
+        posB = ((pos + pos_shift) % len) + w.wp[pattern].loop_start;
+        next_posB = ((next_pos + pos_shift) % len) + w.wp[pattern].loop_start;
+    } else {
+        posB = (((len << 2) + pos + pos_shift) % len) + w.wp[pattern].loop_start;
+        next_posB = (((len << 2) + next_pos + pos_shift) % len) + w.wp[pattern].loop_start;
+    }
+}
+
+void arc_cleanup(void) {
+    next_pattern = pattern;
 }
 
 static void handler_MonomePoll(s32 data) { monome_read_serial(); }
 static void handler_MonomeRefresh(s32 data) {
 	if(monomeFrameDirty) {
-		if(preset_mode == 0) (*re)(); //refresh_mono();
+		if (is_arc_mode) refresh_arc();
+        else if(preset_mode == 0) (*re)(); //refresh_mono();
 		else refresh_preset();
 
 		(*monome_refresh)();
@@ -611,6 +732,7 @@ static void handler_PollADC(s32 data) {
 		// print_dbg_ulong(clock_time);
 
 		timer_set(&clockTimer, clock_time);
+        timer_set(&clockTimerB, clock_time);
 	}
 	clock_temp = i;
 
@@ -1540,8 +1662,120 @@ static void handler_MonomeGridKey(s32 data) {
 	}
 }
 
+static void handler_MonomeRingEnc(s32 data) {
+	u8 n;
+	s8 delta;
+	monome_ring_enc_parse_event_data(data, &n, &delta);
+	
+	if (delta > 0) {
+		if (encoder_delta[n] > 0) encoder_delta[n] += delta; else encoder_delta[n] = delta;
+	} else {
+		if (encoder_delta[n] < 0) encoder_delta[n] += delta; else encoder_delta[n] = delta;
+	}
+	
+	if (abs(encoder_delta[n]) < 40) // adjusts how sensitive the encoders are
+		return;
+	
+	encoder_delta[n] = 0;
+    
+    switch (arc_page) {
+        case ARC_PAGE_FADER:
+            switch (n) {
+                case 0:
+                    if (delta > 0) {
+                        pattern = (pattern + 1) & 15;
+                    } else {
+                        if (pattern == 0) pattern = 15; else pattern--;
+                    }
+                    break;
+                case 1:
+                    break;
+                case 2:
+                    break;
+                case 3:
+                    if (delta > 0) {
+                        next_pattern = (next_pattern + 1) & 15;
+                    } else {
+                        if (next_pattern == 0) next_pattern = 15; else next_pattern--;
+                    }
+                    break;
+            }
+            break;
+        case ARC_PAGE_PHASE:
+            switch (n) {
+                case 0:
+                    if (delta > 0) {
+                        if (pos_shift < 8) {
+                            pos_shift++;
+                            if(next_posB == w.wp[pattern].loop_end) next_posB = w.wp[pattern].loop_start;
+                            else if(next_posB >= LENGTH) next_posB = 0;
+                            else next_posB++;
+                        }
+                    } else {
+                        if (pos_shift > -8) {
+                            pos_shift--;
+                            if(next_posB == w.wp[pattern].loop_start) next_posB = w.wp[pattern].loop_end;
+                            else if(next_posB <= 0) next_posB = LENGTH;
+                            else next_posB--;
+                        }
+                    }
+                    break;
+                case 1:
+                    break;
+                case 2:
+                    break;
+                case 3:
+                    break;
+            }
+            break;
+        case ARC_PAGE_SETTINGS:
+            switch (n) {
+                case 0:
+                    break;
+                case 1:
+                    break;
+                case 2:
+                    break;
+                case 3:
+                    break;
+            }
+            break;
+    }
+    monomeFrameDirty = 0b1111;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // application grid redraw
+static void refresh_arc() {
+    for (u16 led = 0; led < 256; led++)
+    {
+        monomeLedBuffer[led] = 0;
+    }
+    
+    u8 l, p;
+    switch (arc_page) {
+        case ARC_PAGE_FADER:
+            l = pattern << 2;
+            monomeLedBuffer[l] = monomeLedBuffer[l+1] = monomeLedBuffer[l+2] = monomeLedBuffer[l+3] = 11;
+            for (u16 led = 64; led < 256; led++) {
+                monomeLedBuffer[led] = 0;
+            }
+            break;
+        case ARC_PAGE_PHASE:
+            p = pos_shift < 0 ? 17 + pos_shift : pos_shift;
+            p = p << 2;
+            for (u8 led = 0; led < 64; led++) {
+                if (!(led & 3)) monomeLedBuffer[led] = 15;
+                else monomeLedBuffer[led] = (led > p - 4 && led < p) ? 8 : 0;
+            }        
+            break;
+        case ARC_PAGE_SETTINGS:
+            break;
+    }
+    monomeFrameDirty = 0b1111;
+}
+
+
 static void refresh() {
 	u8 i1,i2;
 
@@ -2313,6 +2547,7 @@ static void ww_process_ii(uint8_t *data, uint8_t l) {
 			next_pos = d;
 			cut_pos++;
 			timer_set(&clockTimer,clock_time);
+            timer_set(&clockTimerB,clock_time);
 			clock_phase = 1;
 			(*clock_pulse)(clock_phase);
 			break;
@@ -2414,6 +2649,7 @@ static inline void assign_main_event_handlers(void) {
 	app_event_handlers[ kEventMonomePoll ]	= &handler_MonomePoll ;
 	app_event_handlers[ kEventMonomeRefresh ]	= &handler_MonomeRefresh ;
 	app_event_handlers[ kEventMonomeGridKey ]	= &handler_MonomeGridKey ;
+	app_event_handlers[ kEventMonomeRingEnc ]	= &handler_MonomeRingEnc ;
 }
 
 // app event loop
@@ -2603,6 +2839,7 @@ int main(void)
 	clock_external = !gpio_get_pin_value(B09);
 
 	timer_add(&clockTimer,120,&clockTimer_callback, NULL);
+    timer_add(&clockTimerB,120,&clockTimerB_callback, NULL);
 	timer_add(&keyTimer,50,&keyTimer_callback, NULL);
 	timer_add(&adcTimer,100,&adcTimer_callback, NULL);
 	clock_temp = 10000; // out of ADC range to force tempo
