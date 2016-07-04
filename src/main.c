@@ -118,7 +118,7 @@ u8 glyph[8];
 u8 is_arc_mode, arc_page = ARC_PAGE_PHASE;
 s16 encoder_delta[4] = {0, 0, 0, 0};
 u8 clock_phaseB;
-s8 posB, next_posB, pos_shift, step_shift;
+s8 posB, pos_shift, step_shift = 0;
 
 edit_modes edit_mode;
 u8 edit_cv_step, edit_cv_ch;
@@ -170,7 +170,9 @@ static void refresh_mono_256(void);
 static void refresh_preset(void);
 static void refresh_arc(void);
 static void clock(u8 phase);
-void clock_arc(u8 phase, bool is_clock_A);
+void clock_arcA(u8 phase);
+void clock_arcB_on(void* o);
+void clock_arcB_off(void* o);
 void arc_setup(void);
 void arc_cleanup(void);
 
@@ -195,7 +197,10 @@ void flash_unfresh(void);
 void flash_write(void);
 void flash_read(void);
 
-
+// timers
+static softTimer_t clockTimer = { .next = NULL, .prev = NULL };
+static softTimer_t clockTimerB_on = { .next = NULL, .prev = NULL };
+static softTimer_t clockTimerB_off = { .next = NULL, .prev = NULL };
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -206,7 +211,7 @@ void flash_read(void);
 
 void clock(u8 phase) {
     if (is_arc_mode) {
-        clock_arc(phase, true);
+        clock_arcA(phase);
         return;
     }
     
@@ -476,85 +481,108 @@ void clock(u8 phase) {
 	// print_dbg_ulong(pos);
 }
 
-void clock_arc(u8 phase, bool is_clock_A) {
+void clock_arcA(u8 phase) {
+    u32 shift = (clockTimer.ticks * abs(step_shift)) >> 5;
+    u32 delay = step_shift >= 0 ? shift : (clockTimer.ticks << 1) - shift;
+    
     if (phase) {
-        if (is_clock_A) {
-            pos = next_pos;
-            if(pos >= w.wp[pattern].loop_end) next_pos = w.wp[pattern].loop_start;
-			else if(pos >= LENGTH) next_pos = 0;
-			else next_pos++;
-            
-            cv0 = w.wp[pattern].cv_curves[0][pos];
-            spi_selectChip(SPI,DAC_SPI);
-            spi_write(SPI,0x31);	// update A
-            spi_write(SPI,cv0>>4);
-            spi_write(SPI,cv0<<4);
-            spi_unselectChip(SPI,DAC_SPI);
-            
-            triggered = w.wp[pattern].steps[pos];
-			if(w.wp[pattern].tr_mode == 0) {
-				if(triggered & 0x1 && w.tr_mute[0]) gpio_set_gpio_pin(B00);
-				if(triggered & 0x2 && w.tr_mute[1]) gpio_set_gpio_pin(B01);
-			} else {
-				if(w.tr_mute[0]) {
-					if(triggered & 0x1) gpio_set_gpio_pin(B00);
-					else gpio_clr_gpio_pin(B00);
-				}
-				if(w.tr_mute[1]) {
-					if(triggered & 0x2) gpio_set_gpio_pin(B01);
-					else gpio_clr_gpio_pin(B01);
-				}
-			}
+        pos = next_pos;
+        if(pos >= w.wp[pattern].loop_end) next_pos = w.wp[pattern].loop_start;
+        else if(pos >= LENGTH) next_pos = 0;
+        else next_pos++;
+        
+        cv0 = w.wp[pattern].cv_curves[0][pos];
+        spi_selectChip(SPI,DAC_SPI);
+        spi_write(SPI,0x31);	// update A
+        spi_write(SPI,cv0>>4);
+        spi_write(SPI,cv0<<4);
+        spi_unselectChip(SPI,DAC_SPI);
+        
+        triggered = w.wp[pattern].steps[pos];
+        if(w.wp[pattern].tr_mode == 0) {
+            if(triggered & 0x1 && w.tr_mute[0]) gpio_set_gpio_pin(B00);
+            if(triggered & 0x2 && w.tr_mute[1]) gpio_set_gpio_pin(B01);
         } else {
-            posB = next_posB;
-            if(posB >= w.wp[pattern].loop_end) next_posB = w.wp[pattern].loop_start;
-			else if(posB >= LENGTH) next_posB = 0;
-			else next_posB++;
-            
-            gpio_set_gpio_pin(B10);
-            cv1 = w.wp[pattern].cv_curves[1][posB];
-            spi_selectChip(SPI,DAC_SPI);
-            spi_write(SPI,0x38);	// update B
-            spi_write(SPI,cv1>>4);
-            spi_write(SPI,cv1<<4);
-            spi_unselectChip(SPI,DAC_SPI);
-            
-            triggered = w.wp[pattern].steps[posB];
-			if(w.wp[pattern].tr_mode == 0) {
-				if(triggered & 0x4 && w.tr_mute[2]) gpio_set_gpio_pin(B02);
-				if(triggered & 0x8 && w.tr_mute[3]) gpio_set_gpio_pin(B03);
-			} else {
-				if(w.tr_mute[2]) {
-					if(triggered & 0x4) gpio_set_gpio_pin(B02);
-					else gpio_clr_gpio_pin(B02);
-				}
-				if(w.tr_mute[3]) {
-					if(triggered & 0x8) gpio_set_gpio_pin(B03);
-					else gpio_clr_gpio_pin(B03);
-				}
-			}
+            if(w.tr_mute[0]) {
+                if(triggered & 0x1) gpio_set_gpio_pin(B00);
+                else gpio_clr_gpio_pin(B00);
+            }
+            if(w.tr_mute[1]) {
+                if(triggered & 0x2) gpio_set_gpio_pin(B01);
+                else gpio_clr_gpio_pin(B01);
+            }
+        }
+        
+        if (delay == 0) {
+            clock_arcB_on(NULL);
+        } else {
+            timer_remove(&clockTimerB_on);
+            timer_add(&clockTimerB_on, delay, &clock_arcB_on, NULL);
         }
     } else {
-        if (is_clock_A) {
-            if(w.wp[pattern].tr_mode == 0) {
-                gpio_clr_gpio_pin(B00);
-                gpio_clr_gpio_pin(B01);
-            }
-        } else {
-            gpio_clr_gpio_pin(B10);
-            if(w.wp[pattern].tr_mode == 0) {
-                gpio_clr_gpio_pin(B02);
-                gpio_clr_gpio_pin(B03);
-            }
+        if(w.wp[pattern].tr_mode == 0) {
+            gpio_clr_gpio_pin(B00);
+            gpio_clr_gpio_pin(B01);
         }
+        
+        if (delay == 0) {
+            clock_arcB_off(NULL);
+        } else {
+            timer_remove(&clockTimerB_off);
+            timer_add(&clockTimerB_off, delay, &clock_arcB_off, NULL);
+        }
+    }
+}
+
+void clock_arcB_on(void* o) {
+    timer_remove(&clockTimerB_on);
+    
+    u8 len = w.wp[pattern].loop_end - w.wp[pattern].loop_start + 1;
+    s8 pos_shift_actual = pos_shift;
+    if (step_shift < 0) pos_shift_actual++;
+    if (pos_shift_actual > 0) {
+        posB = ((pos + pos_shift_actual) % len) + w.wp[pattern].loop_start;
+    } else {
+        posB = (((len << 2) + pos + pos_shift_actual) % len) + w.wp[pattern].loop_start;
+    }
+    
+    gpio_set_gpio_pin(B10);
+    cv1 = w.wp[pattern].cv_curves[1][posB];
+    spi_selectChip(SPI,DAC_SPI);
+    spi_write(SPI,0x38);	// update B
+    spi_write(SPI,cv1>>4);
+    spi_write(SPI,cv1<<4);
+    spi_unselectChip(SPI,DAC_SPI);
+    
+    triggered = w.wp[pattern].steps[posB];
+    if(w.wp[pattern].tr_mode == 0) {
+        if(triggered & 0x4 && w.tr_mute[2]) gpio_set_gpio_pin(B02);
+        if(triggered & 0x8 && w.tr_mute[3]) gpio_set_gpio_pin(B03);
+    } else {
+        if(w.tr_mute[2]) {
+            if(triggered & 0x4) gpio_set_gpio_pin(B02);
+            else gpio_clr_gpio_pin(B02);
+        }
+        if(w.tr_mute[3]) {
+            if(triggered & 0x8) gpio_set_gpio_pin(B03);
+            else gpio_clr_gpio_pin(B03);
+        }
+    }
+}
+
+void clock_arcB_off(void* o) {
+    timer_remove(&clockTimerB_off);
+    
+    gpio_clr_gpio_pin(B10);
+    if(w.wp[pattern].tr_mode == 0) {
+        gpio_clr_gpio_pin(B02);
+        gpio_clr_gpio_pin(B03);
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 // timers
 
-static softTimer_t clockTimer = { .next = NULL, .prev = NULL };
-static softTimer_t clockTimerB = { .next = NULL, .prev = NULL };
 static softTimer_t keyTimer = { .next = NULL, .prev = NULL };
 static softTimer_t adcTimer = { .next = NULL, .prev = NULL };
 static softTimer_t monomePollTimer = { .next = NULL, .prev = NULL };
@@ -573,13 +601,6 @@ static void clockTimer_callback(void* o) {
 		clock_phase++;
 		if(clock_phase>1) clock_phase=0;
 		(*clock_pulse)(clock_phase);
-	}
-}
-
-static void clockTimerB_callback(void* o) {  
-	if(clock_external == 0 && is_arc_mode) {
-		clock_phaseB ^= 1;
-		clock_arc(clock_phaseB, false);
 	}
 }
 
@@ -672,19 +693,6 @@ static void handler_MonomeConnect(s32 data) {
 
 void arc_setup(void) {
     LENGTH = 15;
-
-    clockTimerB.ticks = clockTimer.ticks;
-    clockTimerB.ticksRemain = clockTimer.ticksRemain;
-
-    u8 len = w.wp[pattern].loop_end - w.wp[pattern].loop_start + 1;
-    clock_phaseB = clock_phase;
-    if (pos_shift > 0) {
-        posB = ((pos + pos_shift) % len) + w.wp[pattern].loop_start;
-        next_posB = ((next_pos + pos_shift) % len) + w.wp[pattern].loop_start;
-    } else {
-        posB = (((len << 2) + pos + pos_shift) % len) + w.wp[pattern].loop_start;
-        next_posB = (((len << 2) + next_pos + pos_shift) % len) + w.wp[pattern].loop_start;
-    }
 }
 
 void arc_cleanup(void) {
@@ -732,7 +740,6 @@ static void handler_PollADC(s32 data) {
 		// print_dbg_ulong(clock_time);
 
 		timer_set(&clockTimer, clock_time);
-        timer_set(&clockTimerB, clock_time);
 	}
 	clock_temp = i;
 
@@ -1705,22 +1712,17 @@ static void handler_MonomeRingEnc(s32 data) {
             switch (n) {
                 case 0:
                     if (delta > 0) {
-                        if (pos_shift < 8) {
-                            pos_shift++;
-                            if(next_posB == w.wp[pattern].loop_end) next_posB = w.wp[pattern].loop_start;
-                            else if(next_posB >= LENGTH) next_posB = 0;
-                            else next_posB++;
-                        }
+                        if (pos_shift < 8) pos_shift++;
                     } else {
-                        if (pos_shift > -8) {
-                            pos_shift--;
-                            if(next_posB == w.wp[pattern].loop_start) next_posB = w.wp[pattern].loop_end;
-                            else if(next_posB <= 0) next_posB = LENGTH;
-                            else next_posB--;
-                        }
+                        if (pos_shift > -8) pos_shift--;
                     }
                     break;
                 case 1:
+                    if (delta > 0) {
+                        if (step_shift < 32) step_shift++;
+                    } else {
+                        if (step_shift > -32) step_shift--;
+                    }
                     break;
                 case 2:
                     break;
@@ -1764,9 +1766,17 @@ static void refresh_arc() {
         case ARC_PAGE_PHASE:
             p = pos_shift < 0 ? 17 + pos_shift : pos_shift;
             p = p << 2;
-            for (u8 led = 0; led < 64; led++) {
+            for (u16 led = 0; led < 64; led++) {
                 if (!(led & 3)) monomeLedBuffer[led] = 15;
                 else monomeLedBuffer[led] = (led > p - 4 && led < p) ? 8 : 0;
+                
+                monomeLedBuffer[led+64] = led + 1 >= step_shift ? 8 : 0;
+                
+                if (step_shift >= 0) {
+                    monomeLedBuffer[led+64] = led < step_shift ? 8 : 0;
+                } else {
+                    monomeLedBuffer[led+64] = led >= 64 + step_shift ? 8 : 0;
+                }
             }        
             break;
         case ARC_PAGE_SETTINGS:
@@ -2547,7 +2557,6 @@ static void ww_process_ii(uint8_t *data, uint8_t l) {
 			next_pos = d;
 			cut_pos++;
 			timer_set(&clockTimer,clock_time);
-            timer_set(&clockTimerB,clock_time);
 			clock_phase = 1;
 			(*clock_pulse)(clock_phase);
 			break;
@@ -2839,7 +2848,6 @@ int main(void)
 	clock_external = !gpio_get_pin_value(B09);
 
 	timer_add(&clockTimer,120,&clockTimer_callback, NULL);
-    timer_add(&clockTimerB,120,&clockTimerB_callback, NULL);
 	timer_add(&keyTimer,50,&keyTimer_callback, NULL);
 	timer_add(&adcTimer,100,&adcTimer_callback, NULL);
 	clock_temp = 10000; // out of ADC range to force tempo
