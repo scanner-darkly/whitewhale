@@ -117,8 +117,9 @@ u8 glyph[8];
 
 u8 is_arc_mode, arc_page = ARC_PAGE_PHASE;
 s16 encoder_delta[4] = {0, 0, 0, 0};
-u8 clock_phaseB;
-s8 posB, pos_shift, step_shift = 0;
+u8 clock_phaseB1, clock_phaseB2;
+s8 posB1, next_posB1, posB2, next_posB2, pos_shift = 0, step_shift = 0, speed_shift = 0, swing_shift = 0;
+u8 clock_onB1 = 0, clock_onB2 = 0, gate_onB1[2] = {0, 0}, gate_onB2[2] = {0, 0};
 
 edit_modes edit_mode;
 u8 edit_cv_step, edit_cv_ch;
@@ -171,10 +172,22 @@ static void refresh_preset(void);
 static void refresh_arc(void);
 static void clock(u8 phase);
 void clock_arcA(u8 phase);
-void clock_arcB_on(void* o);
-void clock_arcB_off(void* o);
+void clock_arcB1(u8 phase);
+void clock_arcB2(u8 phase);
+
+void arc_cvA(u8 phase);
+void arc_cvB(u8 phase, u8 pos, u8 isB1);
 void arc_setup(void);
 void arc_cleanup(void);
+void arc_update_clocks(void);
+void arc_update_clockB2(void);
+s8 arc_shift_pos(s8 pos, s8 shift);
+void arc_shift_step(softTimer_t* timer, s8 shift_, u8 fix_phase, u8 relative, u8 isB1, u8* clock_phase, s8* pos, s8* next_pos);
+void arc_clock_speed_changed(void);
+void arc_pos_shift_changed(s8 delta);
+void arc_step_shift_changed(s8 delta);
+void arc_swing_shift_changed(s8 delta);
+void arc_speed_shift_changed(s8 delta);
 
 // start/stop monome polling/refresh timers
 extern void timers_set_monome(void);
@@ -199,8 +212,8 @@ void flash_read(void);
 
 // timers
 static softTimer_t clockTimer = { .next = NULL, .prev = NULL };
-static softTimer_t clockTimerB_on = { .next = NULL, .prev = NULL };
-static softTimer_t clockTimerB_off = { .next = NULL, .prev = NULL };
+static softTimer_t clockTimerB1 = { .next = NULL, .prev = NULL };
+static softTimer_t clockTimerB2 = { .next = NULL, .prev = NULL };
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -482,15 +495,33 @@ void clock(u8 phase) {
 }
 
 void clock_arcA(u8 phase) {
-    u32 shift = (clockTimer.ticks * abs(step_shift)) >> 5;
-    u32 delay = step_shift >= 0 ? shift : (clockTimer.ticks << 1) - shift;
-    
     if (phase) {
         pos = next_pos;
         if(pos >= w.wp[pattern].loop_end) next_pos = w.wp[pattern].loop_start;
         else if(pos >= LENGTH) next_pos = 0;
         else next_pos++;
-        
+    }
+    arc_cvA(phase);
+}
+
+void clock_arcB1(u8 phase) {
+    if (phase) {
+        posB1 = next_posB1;
+        next_posB1 = arc_shift_pos(next_posB1, 1);
+    }
+    if (!((posB1 - w.wp[pattern].loop_start)& 1)) arc_cvB(phase, posB1, 1);
+}
+
+void clock_arcB2(u8 phase) {
+    if (phase) {
+        posB2 = next_posB2;
+        next_posB2 = arc_shift_pos(next_posB2, 1);
+    }
+    if ((posB2 - w.wp[pattern].loop_start) & 1) arc_cvB(phase, posB2, 0);
+}
+
+void arc_cvA(u8 phase) {
+    if (phase) {
         cv0 = w.wp[pattern].cv_curves[0][pos];
         spi_selectChip(SPI,DAC_SPI);
         spi_write(SPI,0x31);	// update A
@@ -512,71 +543,206 @@ void clock_arcA(u8 phase) {
                 else gpio_clr_gpio_pin(B01);
             }
         }
-        
-        if (delay == 0) {
-            clock_arcB_on(NULL);
-        } else {
-            timer_remove(&clockTimerB_on);
-            timer_add(&clockTimerB_on, delay, &clock_arcB_on, NULL);
-        }
     } else {
         if(w.wp[pattern].tr_mode == 0) {
             gpio_clr_gpio_pin(B00);
             gpio_clr_gpio_pin(B01);
         }
+    }
+}
+
+void arc_cvB(u8 phase, u8 pos, u8 isB1) {
+    s8 tr2, tr3;
+    tr2 = tr3 = -1;
+    if (phase) {
+        cv1 = w.wp[pattern].cv_curves[1][pos];
+        spi_selectChip(SPI,DAC_SPI);
+        spi_write(SPI,0x38);	// update B
+        spi_write(SPI,cv1>>4);
+        spi_write(SPI,cv1<<4);
+        spi_unselectChip(SPI,DAC_SPI);
         
-        if (delay == 0) {
-            clock_arcB_off(NULL);
+        triggered = w.wp[pattern].steps[pos];
+        if(w.wp[pattern].tr_mode == 0) {
+            if(triggered & 0x4 && w.tr_mute[2]) tr2 = 1;
+            if(triggered & 0x8 && w.tr_mute[3]) tr3 = 1;
         } else {
-            timer_remove(&clockTimerB_off);
-            timer_add(&clockTimerB_off, delay, &clock_arcB_off, NULL);
+            if(w.tr_mute[2]) {
+                tr2 = triggered & 0x4 ? 1 : 0;
+            }
+            if(w.tr_mute[3]) {
+                tr3 = triggered & 0x8 ? 1 : 0;
+            }
         }
+    } else {
+        if(w.wp[pattern].tr_mode == 0) {
+            tr2 = tr3 = 0;
+        }
+    }
+    
+    if (phase) {
+        gpio_set_gpio_pin(B10);
+        if (isB1) clock_onB1 = 1; else clock_onB2 = 1;
+    } else {
+        if (isB1) {
+            if (!clock_onB2) gpio_clr_gpio_pin(B10);
+            clock_onB1 = 0;
+        } else {
+            if (!clock_onB1) gpio_clr_gpio_pin(B10);
+            clock_onB2 = 0;
+        }
+    }
+    
+    if (tr2 == 1) {
+        gpio_set_gpio_pin(B02);
+        if (isB1) gate_onB1[0] = 1; else gate_onB2[0] = 1;
+    } else if (tr2 == 0) {
+        if (isB1 && !gate_onB2[0]) gpio_clr_gpio_pin(B02);
+        else if (!isB1 && !gate_onB1[0]) gpio_clr_gpio_pin(B02);
+        if (isB1) gate_onB1[0] = 0; else gate_onB2[0] = 0;
+    }
+    if (tr3 == 1) {
+        gpio_set_gpio_pin(B03);
+        if (isB1) gate_onB1[1] = 1; else gate_onB2[1] = 1;
+    } else if (tr3 == 0) {
+        if (isB1 && !gate_onB2[1]) gpio_clr_gpio_pin(B03);
+        else if (!isB1 && !gate_onB1[1]) gpio_clr_gpio_pin(B03);
+        if (isB1) gate_onB1[1] = 0; else gate_onB2[1] = 0;
     }
 }
 
-void clock_arcB_on(void* o) {
-    timer_remove(&clockTimerB_on);
-    
-    u8 len = w.wp[pattern].loop_end - w.wp[pattern].loop_start + 1;
-    s8 pos_shift_actual = pos_shift;
-    if (step_shift < 0) pos_shift_actual++;
-    if (pos_shift_actual > 0) {
-        posB = ((pos + pos_shift_actual) % len) + w.wp[pattern].loop_start;
+void arc_update_clocks() {
+    posB2 = posB1 = arc_shift_pos(pos, pos_shift);
+    next_posB2 = next_posB1 = arc_shift_pos(next_pos, pos_shift);
+    clockTimerB2.ticks = clockTimerB1.ticks = clockTimer.ticks;
+    clockTimerB2.ticksRemain = clockTimerB1.ticksRemain = clockTimer.ticksRemain;
+    clock_phaseB2 = clock_phaseB1 = clock_phase;
+    // must be applied after arc_shift_pos()
+    arc_shift_step(&clockTimerB1, step_shift, 0, 0, 1, &clock_phaseB1, &posB1, &next_posB1);
+    arc_shift_step(&clockTimerB2, step_shift + swing_shift, 1, 0, 0, &clock_phaseB2, &posB2, &next_posB2);
+}
+
+void arc_update_clockB2() {
+    posB2 = posB1;
+    next_posB2 = next_posB1;
+    clockTimerB2.ticks = clockTimerB1.ticks;
+    clockTimerB2.ticksRemain = clockTimerB1.ticksRemain;
+    clock_phaseB2 = clock_phaseB1;
+    arc_shift_step(&clockTimerB2, swing_shift, 1, 0, 0, &clock_phaseB2, &posB2, &next_posB2);
+}
+
+s8 arc_shift_pos(s8 pos, s8 shift) {
+    s8 shifted = pos;
+    if (shift > 0) {
+        for (u8 i = 0; i < shift; i++) {
+            if (shifted == w.wp[pattern].loop_end) shifted = w.wp[pattern].loop_start;
+            else if (shifted >= LENGTH) shifted = 0;
+            else shifted++;
+        }
     } else {
-        posB = (((len << 2) + pos + pos_shift_actual) % len) + w.wp[pattern].loop_start;
+        for (u8 i = 0; i < abs(shift); i++) {
+			if (shifted == w.wp[pattern].loop_start) shifted = w.wp[pattern].loop_end;
+			else if (shifted <= 0) shifted = LENGTH;
+			else shifted--;
+        }
+    }
+    return shifted;
+}
+
+void arc_shift_step(softTimer_t* timer, s8 shift_, u8 fix_phase, u8 relative, u8 isB1, u8* clock_phase, s8* pos, s8* next_pos) {
+    s8 shift = shift_;
+    u32 delta = (timer->ticks * abs(shift)) >> 5;
+    
+    if (fix_phase) {
+        if (swing_shift == 32) {
+            if (shift == 0) {
+                shift = -1;
+                delta = 1;
+            } else 
+                delta += shift > 0 ? -1 : 1;
+        } else if (swing_shift == -32) {
+            if (shift == 0) {
+                shift = 1;
+                delta = 1;
+            } else 
+                delta += shift > 0 ? 1 : -1;
+        }
     }
     
-    gpio_set_gpio_pin(B10);
-    cv1 = w.wp[pattern].cv_curves[1][posB];
-    spi_selectChip(SPI,DAC_SPI);
-    spi_write(SPI,0x38);	// update B
-    spi_write(SPI,cv1>>4);
-    spi_write(SPI,cv1<<4);
-    spi_unselectChip(SPI,DAC_SPI);
-    
-    triggered = w.wp[pattern].steps[posB];
-    if(w.wp[pattern].tr_mode == 0) {
-        if(triggered & 0x4 && w.tr_mute[2]) gpio_set_gpio_pin(B02);
-        if(triggered & 0x8 && w.tr_mute[3]) gpio_set_gpio_pin(B03);
+    u32 tR = timer->ticksRemain;
+    if (shift < 0) {
+        if (delta < tR) {
+            tR -= delta;
+        } else {
+            if (*clock_phase == 0 || (delta - tR) >= timer->ticks) {
+                *pos = arc_shift_pos(*pos, 1);
+                *next_pos = arc_shift_pos(*next_pos, 1);
+            }
+            if ((delta - tR) < timer->ticks) *clock_phase ^= 1;
+            tR = timer->ticks > delta ? (tR + timer->ticks) - delta : (tR + (timer->ticks << 1)) - delta;
+            if (relative) arc_cvB(*clock_phase, *pos, isB1);
+        }
+    } else if (shift > 0) {
+        u32 elapsed = timer->ticks - tR;
+        if (delta <= elapsed) {
+            tR += delta;
+        } else {
+            if (*clock_phase == 1 || (delta - elapsed) > timer->ticks) {
+                *pos = arc_shift_pos(*pos, -1);
+                *next_pos = arc_shift_pos(*next_pos, -1);
+            }
+            if (delta - elapsed <= timer->ticks) *clock_phase ^= 1;
+            tR = delta - elapsed;
+            if (relative) arc_cvB(*clock_phase, *pos, isB1);
+        }
+    }
+    tR %= timer->ticks;
+    if (tR == 0) tR = timer->ticks;
+    timer->ticksRemain = tR;
+}
+
+void arc_clock_speed_changed(void) {
+    if (speed_shift == 0) {
+        arc_update_clocks();
     } else {
-        if(w.tr_mute[2]) {
-            if(triggered & 0x4) gpio_set_gpio_pin(B02);
-            else gpio_clr_gpio_pin(B02);
-        }
-        if(w.tr_mute[3]) {
-            if(triggered & 0x8) gpio_set_gpio_pin(B03);
-            else gpio_clr_gpio_pin(B03);
-        }
+        clockTimerB1.ticks = clockTimer.ticks - speed_shift;
+        arc_update_clockB2();
     }
 }
 
-void clock_arcB_off(void* o) {
-    timer_remove(&clockTimerB_off);
-    
-    gpio_clr_gpio_pin(B10);
-    if(w.wp[pattern].tr_mode == 0) {
-        gpio_clr_gpio_pin(B02);
-        gpio_clr_gpio_pin(B03);
+void arc_pos_shift_changed(s8 delta) {
+    posB1 = arc_shift_pos(posB1, delta);
+    next_posB1 = arc_shift_pos(next_posB1, delta);
+    posB2 = arc_shift_pos(posB2, delta);
+    next_posB2 = arc_shift_pos(next_posB2, delta);
+}
+
+void arc_step_shift_changed(s8 delta) {
+    arc_shift_step(&clockTimerB1, delta, 0, 1, 1, &clock_phaseB1, &posB1, &next_posB1);
+    arc_shift_step(&clockTimerB2, delta, 0, 1, 0, &clock_phaseB2, &posB2, &next_posB2);
+}
+
+void arc_swing_shift_changed(s8 delta) {
+    if (speed_shift == 0) {
+        if (abs(swing_shift) == 32) 
+            arc_update_clocks();
+        else {
+            arc_shift_step(&clockTimerB2, delta, 0, 1, 0, &clock_phaseB2, &posB2, &next_posB2);
+        }
+    } else {
+        if (abs(swing_shift) == 32)
+            arc_update_clockB2();
+        else
+            arc_shift_step(&clockTimerB2, delta, 0, 1, 0, &clock_phaseB2, &posB2, &next_posB2);
+    }
+}
+
+void arc_speed_shift_changed(s8 delta) {
+    if (speed_shift == 0) {
+        arc_update_clocks();
+    } else {
+        clockTimerB1.ticks -= delta;
+        arc_update_clockB2();
     }
 }
 
@@ -601,6 +767,20 @@ static void clockTimer_callback(void* o) {
 		clock_phase++;
 		if(clock_phase>1) clock_phase=0;
 		(*clock_pulse)(clock_phase);
+	}
+}
+
+static void clockTimerB1_callback(void* o) {  
+	if(clock_external == 0 && is_arc_mode) {
+		clock_phaseB1 ^= 1;
+		clock_arcB1(clock_phaseB1);
+	}
+}
+
+static void clockTimerB2_callback(void* o) {  
+	if(clock_external == 0 && is_arc_mode) {
+		clock_phaseB2 ^= 1;
+		clock_arcB2(clock_phaseB2);
 	}
 }
 
@@ -687,16 +867,28 @@ static void handler_MonomeConnect(s32 data) {
 	// monome_set_quadrant_flag(0);
 	// monome_set_quadrant_flag(1);
 	timers_set_monome();
-    is_arc_mode = monome_device() == eDeviceArc;
-    if (is_arc_mode) arc_setup(); else arc_cleanup();
+
+    if (monome_device() == eDeviceArc)
+        arc_setup();
+    else
+        arc_cleanup();
 }
 
 void arc_setup(void) {
-    LENGTH = 15;
+    if (!is_arc_mode) {
+        LENGTH = 15;
+        arc_update_clocks();
+        is_arc_mode = 1;
+    }
+    monomeFrameDirty++;
 }
 
 void arc_cleanup(void) {
-    next_pattern = pattern;
+    if (is_arc_mode) {
+        next_pattern = pattern;
+        is_arc_mode = 0;
+    }
+    monomeFrameDirty++;
 }
 
 static void handler_MonomePoll(s32 data) { monome_read_serial(); }
@@ -740,6 +932,7 @@ static void handler_PollADC(s32 data) {
 		// print_dbg_ulong(clock_time);
 
 		timer_set(&clockTimer, clock_time);
+        arc_clock_speed_changed();
 	}
 	clock_temp = i;
 
@@ -1712,21 +1905,56 @@ static void handler_MonomeRingEnc(s32 data) {
             switch (n) {
                 case 0:
                     if (delta > 0) {
-                        if (pos_shift < 8) pos_shift++;
+                        if (pos_shift < 8) {
+                            pos_shift++;
+                            arc_pos_shift_changed(1);
+                        }
                     } else {
-                        if (pos_shift > -8) pos_shift--;
+                        if (pos_shift > -8) {
+                            pos_shift--;
+                            arc_pos_shift_changed(-1);
+                        }
                     }
                     break;
                 case 1:
                     if (delta > 0) {
-                        if (step_shift < 32) step_shift++;
+                        if (step_shift < 32) {
+                            step_shift++;
+                            arc_step_shift_changed(1);
+                        }
                     } else {
-                        if (step_shift > -32) step_shift--;
+                        if (step_shift > -32) {
+                            step_shift--;
+                            arc_step_shift_changed(-1);
+                        }
                     }
                     break;
                 case 2:
+                    if (delta > 0) {
+                        if (swing_shift < 32) {
+                            swing_shift++;
+                            arc_swing_shift_changed(1);
+                        }
+                    } else {
+                        if (swing_shift > -32) {
+                            swing_shift--;
+                            arc_swing_shift_changed(-1);
+                        }
+                    }
                     break;
                 case 3:
+                    if (delta > 0) {
+                        if (speed_shift < 32) {
+                            speed_shift++;
+                            arc_speed_shift_changed(1);
+                        } 
+                        
+                    } else {
+                        if (speed_shift > -32) {
+                            speed_shift--;
+                            arc_speed_shift_changed(-1);
+                        }
+                    }
                     break;
             }
             break;
@@ -1770,12 +1998,20 @@ static void refresh_arc() {
                 if (!(led & 3)) monomeLedBuffer[led] = 15;
                 else monomeLedBuffer[led] = (led > p - 4 && led < p) ? 8 : 0;
                 
-                monomeLedBuffer[led+64] = led + 1 >= step_shift ? 8 : 0;
-                
                 if (step_shift >= 0) {
                     monomeLedBuffer[led+64] = led < step_shift ? 8 : 0;
                 } else {
                     monomeLedBuffer[led+64] = led >= 64 + step_shift ? 8 : 0;
+                }
+                if (swing_shift >= 0) {
+                    monomeLedBuffer[led+128] = led < swing_shift ? 8 : 0;
+                } else {
+                    monomeLedBuffer[led+128] = led >= 64 + swing_shift ? 8 : 0;
+                }
+                if (speed_shift >= 0) {
+                    monomeLedBuffer[led+192] = led < speed_shift ? 8 : 0;
+                } else {
+                    monomeLedBuffer[led+192] = led >= 64 + speed_shift ? 8 : 0;
                 }
             }        
             break;
@@ -2848,6 +3084,8 @@ int main(void)
 	clock_external = !gpio_get_pin_value(B09);
 
 	timer_add(&clockTimer,120,&clockTimer_callback, NULL);
+    timer_add(&clockTimerB1,120,&clockTimerB1_callback, NULL);
+    timer_add(&clockTimerB2,120,&clockTimerB2_callback, NULL);
 	timer_add(&keyTimer,50,&keyTimer_callback, NULL);
 	timer_add(&adcTimer,100,&adcTimer_callback, NULL);
 	clock_temp = 10000; // out of ADC range to force tempo
