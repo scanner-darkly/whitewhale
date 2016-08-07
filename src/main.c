@@ -117,9 +117,9 @@ u8 glyph[8];
 
 u8 is_arc_mode, arc_page = ARC_PAGE_PHASE;
 s16 encoder_delta[4] = {0, 0, 0, 0};
-u8 clock_phaseB1, clock_phaseB2;
 s8 posB1, next_posB1, posB2, next_posB2, pos_shift = 0, step_shift = 0, speed_shift = 0, swing_shift = 0;
 u8 clock_onB1 = 0, clock_onB2 = 0, gate_onB1[2] = {0, 0}, gate_onB2[2] = {0, 0};
+u32 clock_pulse_width = 120;
 
 edit_modes edit_mode;
 u8 edit_cv_step, edit_cv_ch;
@@ -172,8 +172,8 @@ static void refresh_preset(void);
 static void refresh_arc(void);
 static void clock(u8 phase);
 void clock_arcA(u8 phase);
-void clock_arcB1(u8 phase);
-void clock_arcB2(u8 phase);
+void clock_arcB1(void);
+void clock_arcB2(void);
 
 void arc_cvA(u8 phase);
 void arc_cvB(u8 phase, u8 pos, u8 isB1);
@@ -182,12 +182,14 @@ void arc_cleanup(void);
 void arc_update_clocks(void);
 void arc_update_clockB2(void);
 s8 arc_shift_pos(s8 pos, s8 shift);
-void arc_shift_step(softTimer_t* timer, s8 shift_, u8 fix_phase, u8 relative, u8 isB1, u8* clock_phase, s8* pos, s8* next_pos);
+void arc_shift_step(softTimer_t* timer, s8 shift_, u8 fix_phase, s8* pos, s8* next_pos);
 void arc_clock_speed_changed(void);
 void arc_pos_shift_changed(s8 delta);
 void arc_step_shift_changed(s8 delta);
 void arc_swing_shift_changed(s8 delta);
 void arc_speed_shift_changed(s8 delta);
+static void clockTimerB1_off_callback(void* o);
+static void clockTimerB2_off_callback(void* o);
 
 // start/stop monome polling/refresh timers
 extern void timers_set_monome(void);
@@ -214,6 +216,8 @@ void flash_read(void);
 static softTimer_t clockTimer = { .next = NULL, .prev = NULL };
 static softTimer_t clockTimerB1 = { .next = NULL, .prev = NULL };
 static softTimer_t clockTimerB2 = { .next = NULL, .prev = NULL };
+static softTimer_t clockTimerB1_off = { .next = NULL, .prev = NULL };
+static softTimer_t clockTimerB2_off = { .next = NULL, .prev = NULL };
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -504,20 +508,24 @@ void clock_arcA(u8 phase) {
     arc_cvA(phase);
 }
 
-void clock_arcB1(u8 phase) {
-    if (phase) {
-        posB1 = next_posB1;
-        next_posB1 = arc_shift_pos(next_posB1, 1);
+void clock_arcB1() {
+    posB1 = next_posB1;
+    next_posB1 = arc_shift_pos(next_posB1, 1);
+    if (!((posB1 - w.wp[pattern].loop_start)& 1)) {
+        timer_remove(&clockTimerB1_off);
+        timer_add(&clockTimerB1_off, clock_pulse_width, &clockTimerB1_off_callback, NULL);
+        arc_cvB(1, posB1, 1);
     }
-    if (!((posB1 - w.wp[pattern].loop_start)& 1)) arc_cvB(phase, posB1, 1);
 }
 
-void clock_arcB2(u8 phase) {
-    if (phase) {
-        posB2 = next_posB2;
-        next_posB2 = arc_shift_pos(next_posB2, 1);
+void clock_arcB2() {
+    posB2 = next_posB2;
+    next_posB2 = arc_shift_pos(next_posB2, 1);
+    if ((posB2 - w.wp[pattern].loop_start) & 1) {
+        timer_remove(&clockTimerB2_off);
+        timer_add(&clockTimerB2_off, clock_pulse_width, &clockTimerB2_off_callback, NULL);
+        arc_cvB(1, posB2, 0);
     }
-    if ((posB2 - w.wp[pattern].loop_start) & 1) arc_cvB(phase, posB2, 0);
 }
 
 void arc_cvA(u8 phase) {
@@ -552,6 +560,13 @@ void arc_cvA(u8 phase) {
 }
 
 void arc_cvB(u8 phase, u8 pos, u8 isB1) {
+    if (!phase) {
+        if (isB1)
+            timer_remove(&clockTimerB1_off);
+        else
+            timer_remove(&clockTimerB2_off);
+    }
+    
     s8 tr2, tr3;
     tr2 = tr3 = -1;
     if (phase) {
@@ -612,14 +627,14 @@ void arc_cvB(u8 phase, u8 pos, u8 isB1) {
 }
 
 void arc_update_clocks() {
-    posB2 = posB1 = arc_shift_pos(pos, pos_shift);
-    next_posB2 = next_posB1 = arc_shift_pos(next_pos, pos_shift);
-    clockTimerB2.ticks = clockTimerB1.ticks = clockTimer.ticks;
-    clockTimerB2.ticksRemain = clockTimerB1.ticksRemain = clockTimer.ticksRemain;
-    clock_phaseB2 = clock_phaseB1 = clock_phase;
-    // must be applied after arc_shift_pos()
-    arc_shift_step(&clockTimerB1, step_shift, 0, 0, 1, &clock_phaseB1, &posB1, &next_posB1);
-    arc_shift_step(&clockTimerB2, step_shift + swing_shift, 1, 0, 0, &clock_phaseB2, &posB2, &next_posB2);
+    posB1 = arc_shift_pos(pos, -pos_shift);
+    next_posB1 = arc_shift_pos(next_pos, -pos_shift);
+    clockTimerB1.ticks = clockTimer.ticks << 1;
+    clockTimerB1.ticksRemain = clockTimer.ticksRemain;
+    if (clock_phase) clockTimerB1.ticksRemain += clockTimer.ticks;
+    // must be applied last
+    arc_shift_step(&clockTimerB1, step_shift, 0, &posB1, &next_posB1);
+    arc_update_clockB2();
 }
 
 void arc_update_clockB2() {
@@ -627,8 +642,7 @@ void arc_update_clockB2() {
     next_posB2 = next_posB1;
     clockTimerB2.ticks = clockTimerB1.ticks;
     clockTimerB2.ticksRemain = clockTimerB1.ticksRemain;
-    clock_phaseB2 = clock_phaseB1;
-    arc_shift_step(&clockTimerB2, swing_shift, 1, 0, 0, &clock_phaseB2, &posB2, &next_posB2);
+    arc_shift_step(&clockTimerB2, swing_shift, 1, &posB2, &next_posB2);
 }
 
 s8 arc_shift_pos(s8 pos, s8 shift) {
@@ -649,9 +663,10 @@ s8 arc_shift_pos(s8 pos, s8 shift) {
     return shifted;
 }
 
-void arc_shift_step(softTimer_t* timer, s8 shift_, u8 fix_phase, u8 relative, u8 isB1, u8* clock_phase, s8* pos, s8* next_pos) {
+void arc_shift_step(softTimer_t* timer, s8 shift_, u8 fix_phase, s8* pos, s8* next_pos) {
     s8 shift = shift_;
-    u32 delta = (timer->ticks * abs(shift)) >> 5;
+    u32 delta = (clockTimer.ticks * abs(shift)) >> 5;
+    u32 cycle_x2 = clockTimer.ticks << 1;
     
     if (fix_phase) {
         if (swing_shift == 32) {
@@ -674,52 +689,44 @@ void arc_shift_step(softTimer_t* timer, s8 shift_, u8 fix_phase, u8 relative, u8
         if (delta < tR) {
             tR -= delta;
         } else {
-            if (*clock_phase == 0 || (delta - tR) >= timer->ticks) {
-                *pos = arc_shift_pos(*pos, 1);
-                *next_pos = arc_shift_pos(*next_pos, 1);
-            }
-            if ((delta - tR) < timer->ticks) *clock_phase ^= 1;
-            tR = timer->ticks > delta ? (tR + timer->ticks) - delta : (tR + (timer->ticks << 1)) - delta;
-            if (relative) arc_cvB(*clock_phase, *pos, isB1);
+            *pos = arc_shift_pos(*pos, 1);
+            *next_pos = arc_shift_pos(*next_pos, 1);
+            tR += cycle_x2 - delta;
         }
     } else if (shift > 0) {
-        u32 elapsed = timer->ticks - tR;
+        u32 elapsed = cycle_x2 - tR;
         if (delta <= elapsed) {
             tR += delta;
         } else {
-            if (*clock_phase == 1 || (delta - elapsed) > timer->ticks) {
-                *pos = arc_shift_pos(*pos, -1);
-                *next_pos = arc_shift_pos(*next_pos, -1);
-            }
-            if (delta - elapsed <= timer->ticks) *clock_phase ^= 1;
+            *pos = arc_shift_pos(*pos, -1);
+            *next_pos = arc_shift_pos(*next_pos, -1);
             tR = delta - elapsed;
-            if (relative) arc_cvB(*clock_phase, *pos, isB1);
         }
     }
-    tR %= timer->ticks;
-    if (tR == 0) tR = timer->ticks;
     timer->ticksRemain = tR;
 }
 
 void arc_clock_speed_changed(void) {
     if (speed_shift == 0) {
+        clock_pulse_width = clockTimer.ticks;
         arc_update_clocks();
     } else {
-        clockTimerB1.ticks = clockTimer.ticks - speed_shift;
+        clockTimerB1.ticks = (clockTimer.ticks << 1) - speed_shift;
+        clock_pulse_width = clockTimerB1.ticks >> 1;
         arc_update_clockB2();
     }
 }
 
 void arc_pos_shift_changed(s8 delta) {
-    posB1 = arc_shift_pos(posB1, delta);
-    next_posB1 = arc_shift_pos(next_posB1, delta);
-    posB2 = arc_shift_pos(posB2, delta);
-    next_posB2 = arc_shift_pos(next_posB2, delta);
+    posB1 = arc_shift_pos(posB1, -delta);
+    next_posB1 = arc_shift_pos(next_posB1, -delta);
+    posB2 = arc_shift_pos(posB2, -delta);
+    next_posB2 = arc_shift_pos(next_posB2, -delta);
 }
 
 void arc_step_shift_changed(s8 delta) {
-    arc_shift_step(&clockTimerB1, delta, 0, 1, 1, &clock_phaseB1, &posB1, &next_posB1);
-    arc_shift_step(&clockTimerB2, delta, 0, 1, 0, &clock_phaseB2, &posB2, &next_posB2);
+    arc_shift_step(&clockTimerB1, delta, 0, &posB1, &next_posB1);
+    arc_shift_step(&clockTimerB2, delta, 0, &posB2, &next_posB2);
 }
 
 void arc_swing_shift_changed(s8 delta) {
@@ -727,13 +734,13 @@ void arc_swing_shift_changed(s8 delta) {
         if (abs(swing_shift) == 32) 
             arc_update_clocks();
         else {
-            arc_shift_step(&clockTimerB2, delta, 0, 1, 0, &clock_phaseB2, &posB2, &next_posB2);
+            arc_shift_step(&clockTimerB2, delta, 0, &posB2, &next_posB2);
         }
     } else {
         if (abs(swing_shift) == 32)
             arc_update_clockB2();
         else
-            arc_shift_step(&clockTimerB2, delta, 0, 1, 0, &clock_phaseB2, &posB2, &next_posB2);
+            arc_shift_step(&clockTimerB2, delta, 0, &posB2, &next_posB2);
     }
 }
 
@@ -742,6 +749,7 @@ void arc_speed_shift_changed(s8 delta) {
         arc_update_clocks();
     } else {
         clockTimerB1.ticks -= delta;
+        clock_pulse_width = clockTimerB1.ticks >> 1;
         arc_update_clockB2();
     }
 }
@@ -771,17 +779,19 @@ static void clockTimer_callback(void* o) {
 }
 
 static void clockTimerB1_callback(void* o) {  
-	if(clock_external == 0 && is_arc_mode) {
-		clock_phaseB1 ^= 1;
-		clock_arcB1(clock_phaseB1);
-	}
+	if(is_arc_mode) clock_arcB1();
+}
+
+static void clockTimerB1_off_callback(void* o) {  
+	if(is_arc_mode) arc_cvB(0, posB1, 1);
 }
 
 static void clockTimerB2_callback(void* o) {  
-	if(clock_external == 0 && is_arc_mode) {
-		clock_phaseB2 ^= 1;
-		clock_arcB2(clock_phaseB2);
-	}
+	if(is_arc_mode) clock_arcB2();
+}
+
+static void clockTimerB2_off_callback(void* o) {  
+	if(is_arc_mode) arc_cvB(0, posB2, 0);
 }
 
 static void keyTimer_callback(void* o) {  
@@ -877,7 +887,7 @@ static void handler_MonomeConnect(s32 data) {
 void arc_setup(void) {
     if (!is_arc_mode) {
         LENGTH = 15;
-        arc_update_clocks();
+        arc_clock_speed_changed();
         is_arc_mode = 1;
     }
     monomeFrameDirty++;
@@ -3084,8 +3094,8 @@ int main(void)
 	clock_external = !gpio_get_pin_value(B09);
 
 	timer_add(&clockTimer,120,&clockTimer_callback, NULL);
-    timer_add(&clockTimerB1,120,&clockTimerB1_callback, NULL);
-    timer_add(&clockTimerB2,120,&clockTimerB2_callback, NULL);
+    timer_add(&clockTimerB1,240,&clockTimerB1_callback, NULL);
+    timer_add(&clockTimerB2,240,&clockTimerB2_callback, NULL);
 	timer_add(&keyTimer,50,&keyTimer_callback, NULL);
 	timer_add(&adcTimer,100,&adcTimer_callback, NULL);
 	clock_temp = 10000; // out of ADC range to force tempo
