@@ -120,6 +120,7 @@ s16 encoder_delta[4] = {0, 0, 0, 0};
 s8 posB1, next_posB1, posB2, next_posB2, pos_shift = 0, step_shift = 0, speed_shift = 0, swing_shift = 0;
 u8 clock_onB1 = 0, clock_onB2 = 0, gate_onB1[2] = {0, 0}, gate_onB2[2] = {0, 0};
 u32 clock_pulse_width = 120;
+u64 ext_ticks = 0, ext_ticks_pulse;
 
 edit_modes edit_mode;
 u8 edit_cv_step, edit_cv_ch;
@@ -560,13 +561,6 @@ void arc_cvA(u8 phase) {
 }
 
 void arc_cvB(u8 phase, u8 pos, u8 isB1) {
-    if (!phase) {
-        if (isB1)
-            timer_remove(&clockTimerB1_off);
-        else
-            timer_remove(&clockTimerB2_off);
-    }
-    
     s8 tr2, tr3;
     tr2 = tr3 = -1;
     if (phase) {
@@ -595,35 +589,37 @@ void arc_cvB(u8 phase, u8 pos, u8 isB1) {
         }
     }
     
-    if (phase) {
-        gpio_set_gpio_pin(B10);
-        if (isB1) clock_onB1 = 1; else clock_onB2 = 1;
-    } else {
-        if (isB1) {
-            if (!clock_onB2) gpio_clr_gpio_pin(B10);
-            clock_onB1 = 0;
-        } else {
-            if (!clock_onB1) gpio_clr_gpio_pin(B10);
-            clock_onB2 = 0;
-        }
-    }
+    if (isB1)
+		clock_onB1 = phase;
+	else
+		clock_onB2 = phase;
+
+	if (clock_onB1 || clock_onB2)
+		gpio_set_gpio_pin(B10);
+	else
+		gpio_clr_gpio_pin(B10);
     
-    if (tr2 == 1) {
-        gpio_set_gpio_pin(B02);
-        if (isB1) gate_onB1[0] = 1; else gate_onB2[0] = 1;
-    } else if (tr2 == 0) {
-        if (isB1 && !gate_onB2[0]) gpio_clr_gpio_pin(B02);
-        else if (!isB1 && !gate_onB1[0]) gpio_clr_gpio_pin(B02);
-        if (isB1) gate_onB1[0] = 0; else gate_onB2[0] = 0;
-    }
-    if (tr3 == 1) {
-        gpio_set_gpio_pin(B03);
-        if (isB1) gate_onB1[1] = 1; else gate_onB2[1] = 1;
-    } else if (tr3 == 0) {
-        if (isB1 && !gate_onB2[1]) gpio_clr_gpio_pin(B03);
-        else if (!isB1 && !gate_onB1[1]) gpio_clr_gpio_pin(B03);
-        if (isB1) gate_onB1[1] = 0; else gate_onB2[1] = 0;
-    }
+	if (isB1) {
+		if (tr2 == 1) gate_onB1[0] = 1;
+		else if (tr2 == 0) gate_onB1[0] = 0;
+		if (tr3 == 1) gate_onB1[1] = 1;
+		else if (tr3 == 0) gate_onB1[1] = 0;
+	} else {
+		if (tr2 == 1) gate_onB2[0] = 1;
+		else if (tr2 == 0) gate_onB2[0] = 0;
+		if (tr3 == 1) gate_onB2[1] = 1;
+		else if (tr3 == 0) gate_onB2[1] = 0;
+	}
+	
+	if (gate_onB1[0] || gate_onB2[0])
+		gpio_set_gpio_pin(B02);
+	else
+		gpio_clr_gpio_pin(B02);
+	
+	if (gate_onB1[1] || gate_onB2[1])
+		gpio_set_gpio_pin(B03);
+	else
+		gpio_clr_gpio_pin(B03);
 }
 
 void arc_update_clocks() {
@@ -708,11 +704,11 @@ void arc_shift_step(softTimer_t* timer, s8 shift_, u8 fix_phase, s8* pos, s8* ne
 
 void arc_clock_speed_changed(void) {
     if (speed_shift == 0) {
-        clock_pulse_width = clockTimer.ticks;
+        if (!clock_external) clock_pulse_width = clockTimer.ticks;
         arc_update_clocks();
     } else {
         clockTimerB1.ticks = (clockTimer.ticks << 1) - speed_shift;
-        clock_pulse_width = clockTimerB1.ticks >> 1;
+        if (!clock_external) clock_pulse_width = clockTimerB1.ticks >> 1;
         arc_update_clockB2();
     }
 }
@@ -749,7 +745,7 @@ void arc_speed_shift_changed(s8 delta) {
         arc_update_clocks();
     } else {
         clockTimerB1.ticks -= delta;
-        clock_pulse_width = clockTimerB1.ticks >> 1;
+        if (!clock_external) clock_pulse_width = clockTimerB1.ticks >> 1;
         arc_update_clockB2();
     }
 }
@@ -775,14 +771,18 @@ static void clockTimer_callback(void* o) {
 		clock_phase++;
 		if(clock_phase>1) clock_phase=0;
 		(*clock_pulse)(clock_phase);
-	}
+	} else if (is_arc_mode) {
+		clock_phase++;
+		if(clock_phase>1) clock_phase=0;
+    }
 }
 
 static void clockTimerB1_callback(void* o) {  
 	if(is_arc_mode) clock_arcB1();
 }
 
-static void clockTimerB1_off_callback(void* o) {  
+static void clockTimerB1_off_callback(void* o) {
+	timer_remove(&clockTimerB1_off);
 	if(is_arc_mode) arc_cvB(0, posB1, 1);
 }
 
@@ -791,6 +791,7 @@ static void clockTimerB2_callback(void* o) {
 }
 
 static void clockTimerB2_off_callback(void* o) {  
+	timer_remove(&clockTimerB2_off);
 	if(is_arc_mode) arc_cvB(0, posB2, 0);
 }
 
@@ -941,8 +942,10 @@ static void handler_PollADC(s32 data) {
 		// print_dbg("\r\nnew clock (ms): ");
 		// print_dbg_ulong(clock_time);
 
-		timer_set(&clockTimer, clock_time);
-        arc_clock_speed_changed();
+		if (!clock_external) {
+            timer_set(&clockTimer, clock_time);
+            arc_clock_speed_changed();
+        }
 	}
 	clock_temp = i;
 
@@ -1063,9 +1066,35 @@ static void handler_KeyTimer(s32 data) {
 
 static void handler_ClockNormal(s32 data) {
 	clock_external = !gpio_get_pin_value(B09); 
+    
+    if (is_arc_mode && clock_external) {
+        ext_ticks = ext_ticks_pulse = 0;
+        clock_phase = 0;
+    }
 }
 
 static void handler_ClockExt(s32 data) {
+	if (is_arc_mode) {
+		if (ext_ticks) {
+			if (data) {
+				u32 cycle = (tcTicks - ext_ticks) >> 1;
+				if (cycle == 0) cycle = 120;
+				if (clockTimer.ticks != cycle) {
+					clock_phase = 0;
+					clockTimer.ticks = cycle;
+					clockTimer.ticksRemain = 1;
+					arc_clock_speed_changed();
+				}
+				ext_ticks = ext_ticks_pulse = tcTicks;
+			} else {
+				clock_pulse_width = tcTicks - ext_ticks_pulse;
+				if (clock_pulse_width < 5) clock_pulse_width = 5;
+			}
+		} else {
+			if (data) ext_ticks = ext_ticks_pulse = tcTicks;
+		}
+	}
+	
 	clock(data); 
 }
 
