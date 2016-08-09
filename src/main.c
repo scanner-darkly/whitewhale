@@ -176,6 +176,8 @@ void clock_arcA(u8 phase);
 void clock_arcB1(void);
 void clock_arcB2(void);
 
+u16 get_cv(u8 pattern, u8 pos, u8 a_b);
+s8 get_trigger(u8 pattern, u8 pos, u8 trig);
 void arc_cvA(u8 phase);
 void arc_cvB(u8 phase, u8 pos, u8 isB1);
 void arc_setup(void);
@@ -499,6 +501,77 @@ void clock(u8 phase) {
 	// print_dbg_ulong(pos);
 }
 
+u16 get_cv(u8 pattern, u8 pos, u8 a_b) {
+	u16 cv = 0;
+	static u8 i1, count;
+	static u16 found[16];
+	u8 cv_chosen;
+	
+	if((rnd() % 255) < w.wp[pattern].cv_probs[a_b][pos] && w.cv_mute[a_b]) {
+		if(w.wp[pattern].cv_mode[a_b] == 0) {
+			cv = w.wp[pattern].cv_curves[a_b][pos];
+		}
+		else {
+			count = 0;
+			for(i1=0;i1<16;i1++)
+				if(w.wp[pattern].cv_steps[a_b][pos] & (1<<i1)) {
+					found[count] = i1;
+					count++;
+				}
+			if(count == 1) 
+				cv_chosen = found[0];
+			else
+				cv_chosen = found[rnd() % count];
+			cv = w.wp[pattern].cv_values[cv_chosen];			
+		}
+	}
+	
+	return cv;
+}
+
+s8 get_trigger(u8 pattern, u8 pos, u8 trig) {
+	s8 trigger = -1;
+
+	static u8 i1, count;
+	static u16 found[16];
+	u8 triggered = 0;
+	u8 mask = 1 << trig;
+	u8 offset = trig < 2 ? 0 : 2;
+	
+	if((rnd() % 255) < w.wp[pattern].step_probs[pos]) {
+		
+		if(w.wp[pattern].step_choice & 1<<pos) {
+			count = 0;
+			for(i1=offset;i1<offset+2;i1++)
+				if(w.wp[pattern].steps[pos] >> i1 & 1) {
+					found[count] = i1;
+					count++;
+				}
+
+			if(count == 0)
+				triggered = 0;
+			else if(count == 1)
+				triggered = 1<<found[0];
+			else
+				triggered = 1<<found[rnd()%count];
+		}	
+		else {
+			triggered = w.wp[pattern].steps[pos];
+		}
+		
+		if(w.wp[pattern].tr_mode == 0) {
+			if(triggered & mask && w.tr_mute[trig]) trigger = 1;
+		} else {
+			if(w.tr_mute[trig]) {
+				if(triggered & mask) trigger = 1;
+				else  trigger = 0;
+			}
+		}
+	}
+
+	return trigger;
+}
+
 void clock_arcA(u8 phase) {
     if (phase) {
         pos = next_pos;
@@ -531,27 +604,25 @@ void clock_arcB2() {
 
 void arc_cvA(u8 phase) {
     if (phase) {
-        cv0 = w.wp[pattern].cv_curves[0][pos];
+        cv0 = get_cv(pattern, pos, 0);
         spi_selectChip(SPI,DAC_SPI);
         spi_write(SPI,0x31);	// update A
         spi_write(SPI,cv0>>4);
         spi_write(SPI,cv0<<4);
         spi_unselectChip(SPI,DAC_SPI);
         
-        triggered = w.wp[pattern].steps[pos];
-        if(w.wp[pattern].tr_mode == 0) {
-            if(triggered & 0x1 && w.tr_mute[0]) gpio_set_gpio_pin(B00);
-            if(triggered & 0x2 && w.tr_mute[1]) gpio_set_gpio_pin(B01);
-        } else {
-            if(w.tr_mute[0]) {
-                if(triggered & 0x1) gpio_set_gpio_pin(B00);
-                else gpio_clr_gpio_pin(B00);
-            }
-            if(w.tr_mute[1]) {
-                if(triggered & 0x2) gpio_set_gpio_pin(B01);
-                else gpio_clr_gpio_pin(B01);
-            }
-        }
+        s8 trig;
+		trig = get_trigger(pattern, pos, 0);
+		if (trig == 1)
+			gpio_set_gpio_pin(B00);
+		else if (trig == 0)
+			gpio_clr_gpio_pin(B00);
+		trig = get_trigger(pattern, pos, 1);
+		if (trig == 1)
+			gpio_set_gpio_pin(B01);
+		else if (trig == 0)
+			gpio_clr_gpio_pin(B01);
+		
     } else {
         if(w.wp[pattern].tr_mode == 0) {
             gpio_clr_gpio_pin(B00);
@@ -564,25 +635,15 @@ void arc_cvB(u8 phase, u8 pos, u8 isB1) {
     s8 tr2, tr3;
     tr2 = tr3 = -1;
     if (phase) {
-        cv1 = w.wp[pattern].cv_curves[1][pos];
+        cv1 = get_cv(pattern, pos, 1);
         spi_selectChip(SPI,DAC_SPI);
         spi_write(SPI,0x38);	// update B
         spi_write(SPI,cv1>>4);
         spi_write(SPI,cv1<<4);
         spi_unselectChip(SPI,DAC_SPI);
         
-        triggered = w.wp[pattern].steps[pos];
-        if(w.wp[pattern].tr_mode == 0) {
-            if(triggered & 0x4 && w.tr_mute[2]) tr2 = 1;
-            if(triggered & 0x8 && w.tr_mute[3]) tr3 = 1;
-        } else {
-            if(w.tr_mute[2]) {
-                tr2 = triggered & 0x4 ? 1 : 0;
-            }
-            if(w.tr_mute[3]) {
-                tr3 = triggered & 0x8 ? 1 : 0;
-            }
-        }
+		tr2 = get_trigger(pattern, pos, 2);
+		tr3 = get_trigger(pattern, pos, 3);
     } else {
         if(w.wp[pattern].tr_mode == 0) {
             tr2 = tr3 = 0;
