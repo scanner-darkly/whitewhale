@@ -117,9 +117,9 @@ u8 glyph[8];
 
 u8 is_arc_mode, arc_page = ARC_PAGE_PHASE;
 s16 encoder_delta[4] = {0, 0, 0, 0};
-s8 posB1, next_posB1, posB2, next_posB2, pos_shift = 0, step_shift = 0, speed_shift = 0, swing_shift = 0;
+s8 posB, posB_show, pos_shift = 0, step_shift = 0, speed_shift = 0, swing_shift = 0;
 u8 clock_onB1 = 0, clock_onB2 = 0, gate_onB1[2] = {0, 0}, gate_onB2[2] = {0, 0};
-u32 clock_pulse_width = 120;
+u32 clock_cycle = 120, clock_pulse_width = 120;
 u64 ext_ticks = 0, ext_ticks_pulse;
 
 edit_modes edit_mode;
@@ -172,27 +172,32 @@ static void refresh_mono_256(void);
 static void refresh_preset(void);
 static void refresh_arc(void);
 static void clock(u8 phase);
+
 void clock_arcA(u8 phase);
 void clock_arcB1(void);
 void clock_arcB2(void);
-
-u16 get_cv(u8 pattern, u8 pos, u8 a_b);
-s8 get_trigger(u8 pattern, u8 pos, u8 trig);
 void arc_cvA(u8 phase);
 void arc_cvB(u8 phase, u8 pos, u8 isB1);
-void arc_setup(void);
-void arc_cleanup(void);
-void arc_update_clocks(void);
-void arc_update_clockB2(void);
+
+u16 get_cv(u8 pattern, u8 pos, u8 a_b, u16 prev_cv);
+s8 get_trigger(u8 pattern, u8 pos, u8 trig);
+s8 get_next_pos(u8 pattern, s8 pos);
+u8 get_length(u8 pattern);
+
 s8 arc_shift_pos(s8 pos, s8 shift);
-void arc_shift_step(softTimer_t* timer, s8 shift_, u8 fix_phase, s8* pos, s8* next_pos);
-void arc_clock_speed_changed(void);
+void arc_shift_step(softTimer_t* timer, s8 shift);
+void arc_init_clocks(void);
 void arc_pos_shift_changed(s8 delta);
 void arc_step_shift_changed(s8 delta);
 void arc_swing_shift_changed(s8 delta);
 void arc_speed_shift_changed(s8 delta);
+void arc_clock_cycle_changed(u32 new_cycle);
+
 static void clockTimerB1_off_callback(void* o);
 static void clockTimerB2_off_callback(void* o);
+
+void arc_setup(void);
+void arc_cleanup(void);
 
 // start/stop monome polling/refresh timers
 extern void timers_set_monome(void);
@@ -501,8 +506,10 @@ void clock(u8 phase) {
 	// print_dbg_ulong(pos);
 }
 
-u16 get_cv(u8 pattern, u8 pos, u8 a_b) {
-	u16 cv = 0;
+// returns current cv value for given pattern / pos / track
+// returns prev_cv if it didn't change (for probability)
+u16 get_cv(u8 pattern, u8 pos, u8 a_b, u16 prev_cv) {
+	u16 cv = prev_cv;
 	static u8 i1, count;
 	static u16 found[16];
 	u8 cv_chosen;
@@ -529,6 +536,8 @@ u16 get_cv(u8 pattern, u8 pos, u8 a_b) {
 	return cv;
 }
 
+// returns trigger value for given pattern / pos / trigger
+// returns -1 if trigger doesn't change (for probability)
 s8 get_trigger(u8 pattern, u8 pos, u8 trig) {
 	s8 trigger = -1;
 
@@ -572,39 +581,209 @@ s8 get_trigger(u8 pattern, u8 pos, u8 trig) {
 	return trigger;
 }
 
+// returns next position for given pattern and current position
+s8 get_next_pos(u8 pattern, s8 pos) {
+	s8 next_pos = pos;
+	if(w.wp[pattern].step_mode == mForward) { 		// FORWARD
+		if(pos == w.wp[pattern].loop_end) next_pos = w.wp[pattern].loop_start;
+		else if(pos >= LENGTH) next_pos = 0;
+		else next_pos++;
+	}
+	else if(w.wp[pattern].step_mode == mReverse) {	// REVERSE
+		if(pos == w.wp[pattern].loop_start)
+			next_pos = w.wp[pattern].loop_end;
+		else if(pos <= 0)
+			next_pos = LENGTH;
+		else next_pos--;
+	}
+	else if(w.wp[pattern].step_mode == mDrunk) {	// DRUNK
+		drunk_step += (rnd() % 3) - 1; // -1 to 1
+		if(drunk_step < -1) drunk_step = -1;
+		else if(drunk_step > 1) drunk_step = 1;
+
+		next_pos += drunk_step;
+		if(next_pos < 0) 
+			next_pos = LENGTH;
+		else if(next_pos > LENGTH) 
+			next_pos = 0;
+		else if(w.wp[pattern].loop_dir == 1 && next_pos < w.wp[pattern].loop_start)
+			next_pos = w.wp[pattern].loop_end;
+		else if(w.wp[pattern].loop_dir == 1 && next_pos > w.wp[pattern].loop_end)
+			next_pos = w.wp[pattern].loop_start;
+		else if(w.wp[pattern].loop_dir == 2 && next_pos < w.wp[pattern].loop_start && next_pos > w.wp[pattern].loop_end) {
+			if(drunk_step == 1)
+				next_pos = w.wp[pattern].loop_start;
+			else
+				next_pos = w.wp[pattern].loop_end;
+		}
+	}
+	else if(w.wp[pattern].step_mode == mRandom) {	// RANDOM
+		next_pos = (rnd() % (w.wp[pattern].loop_len + 1)) + w.wp[pattern].loop_start;
+		if(next_pos > LENGTH) next_pos -= LENGTH + 1;
+	}
+	return next_pos;
+}
+
+// returns the total length for given pattern
+u8 get_length(u8 pattern) {
+	return w.wp[pattern].loop_start < w.wp[pattern].loop_end ?
+		w.wp[pattern].loop_end - w.wp[pattern].loop_start + 1 :
+		17 - w.wp[pattern].loop_start + w.wp[pattern].loop_end;
+}
+
 void clock_arcA(u8 phase) {
     if (phase) {
-        pos = next_pos;
-        if(pos >= w.wp[pattern].loop_end) next_pos = w.wp[pattern].loop_start;
-        else if(pos >= LENGTH) next_pos = 0;
-        else next_pos++;
-    }
+		pos = next_pos;
+		next_pos = get_next_pos(pattern, next_pos);
+		monomeFrameDirty++;
+	}
     arc_cvA(phase);
 }
 
 void clock_arcB1() {
-    posB1 = next_posB1;
-    next_posB1 = arc_shift_pos(next_posB1, 1);
-    if (!((posB1 - w.wp[pattern].loop_start)& 1)) {
-        timer_remove(&clockTimerB1_off);
-        timer_add(&clockTimerB1_off, clock_pulse_width, &clockTimerB1_off_callback, NULL);
-        arc_cvB(1, posB1, 1);
+	if (speed_shift) {
+		if (swing_shift >= 0) {
+			posB = get_next_pos(pattern, posB);
+		}
+	} else {
+        if (step_shift < 0) {
+            posB = next_pos;
+			if (step_shift > -31 && step_shift < 31) {
+				// unexpected CV A phase - likely clock_cycle changed, fix position
+				if (clock_external) {
+					if ((tcTicks - ext_ticks) < (clock_cycle >> 1)) posB = pos;
+				} else {
+					if (clock_phase) posB = pos;
+				}
+			}
+        } else {
+            posB = pos;
+			if (step_shift > -31 && step_shift < 31) {
+				// unexpected CV A phase - likely clock_cycle changed, fix position
+				if (clock_external) {
+					if ((tcTicks - ext_ticks) > (clock_cycle >> 1)) posB = next_pos;
+				} else {
+					if (!clock_phase) posB = next_pos;
+				}
+			}
+        }
+		posB = arc_shift_pos(posB, -pos_shift);
+	}
+
+	// calculate when the next clock B1 should occur
+	u64 next_cycle = 0;
+    if (speed_shift) {
+		next_cycle = (s32)clock_cycle > (s32)speed_shift ? (s32)clock_cycle - speed_shift : 5;
+    } else {
+        if (clock_external) {
+            if (ext_ticks) {
+                next_cycle = ext_ticks + clock_cycle;
+                next_cycle = next_cycle - 1 > tcTicks ? next_cycle - tcTicks : clock_cycle;
+                if (step_shift < 0) {
+                    next_cycle += clock_cycle - ((clock_cycle * abs(step_shift)) >> 6);
+                } else {
+                    next_cycle += (clock_cycle * abs(step_shift)) >> 6;
+                }
+            } else {
+                next_cycle = clock_cycle;
+            }
+        } else {
+            next_cycle = clockTimer.ticksRemain;
+            if (clock_phase) next_cycle += clockTimer.ticks;
+            if (step_shift < 0) {
+                next_cycle += (clockTimer.ticks << 1) - ((clockTimer.ticks * abs(step_shift)) >> 5);
+            } else {
+                next_cycle += (clockTimer.ticks * abs(step_shift)) >> 5;
+            }
+        }
     }
+	clockTimerB1.ticksRemain = clockTimerB1.ticks = next_cycle;
+
+    if (!((posB - w.wp[pattern].loop_start) & 1)) {
+		timer_remove(&clockTimerB1_off);
+		timer_add(&clockTimerB1_off, clock_pulse_width, &clockTimerB1_off_callback, NULL);
+		arc_cvB(1, posB, 1);
+	}
 }
 
 void clock_arcB2() {
-    posB2 = next_posB2;
-    next_posB2 = arc_shift_pos(next_posB2, 1);
-    if ((posB2 - w.wp[pattern].loop_start) & 1) {
-        timer_remove(&clockTimerB2_off);
-        timer_add(&clockTimerB2_off, clock_pulse_width, &clockTimerB2_off_callback, NULL);
-        arc_cvB(1, posB2, 0);
+	s8 total_shift = step_shift + swing_shift;
+	if (speed_shift) {
+		if (swing_shift < 0) {
+			posB = get_next_pos(pattern, posB);
+		}
+	} else {
+        if (total_shift < 0) {
+            posB = next_pos;
+			if (abs(total_shift) < 31) {
+				// unexpected CV A phase - likely clock_cycle changed, fix position
+				if (clock_external) {
+					if ((tcTicks - ext_ticks) < (clock_cycle >> 1)) posB = pos;
+				} else {
+					if (clock_phase) posB = pos;
+				}
+			}
+        } else {
+            posB = pos;
+			if (abs(total_shift) < 31) {
+				// unexpected CV A phase - likely clock_cycle changed, fix position
+				if (clock_external) {
+					if ((tcTicks - ext_ticks) > (clock_cycle >> 1)) posB = next_pos;
+				} else {
+					if (!clock_phase) posB = next_pos;
+				}
+			}
+        }
+		posB = arc_shift_pos(posB, -pos_shift);
+	}
+	
+	// calculate when the next clock B2 should occur
+	u64 next_cycle = 0;
+    if (speed_shift) {
+        next_cycle = clockTimerB1.ticksRemain;
+        if (swing_shift < 0) {
+            next_cycle += clockTimerB1.ticks - ((clockTimerB1.ticks * abs(swing_shift)) >> 6);
+        } else {
+            next_cycle += (clockTimerB1.ticks * abs(swing_shift)) >> 6;
+		}
+    } else {
+        if (clock_external) {
+            if (ext_ticks) {
+                next_cycle = ext_ticks + clock_cycle;
+                next_cycle = next_cycle - 1 > tcTicks ? next_cycle - tcTicks : clock_cycle;
+                if (step_shift + swing_shift < 0) {
+                    next_cycle += clock_cycle - ((clock_cycle * abs(step_shift + swing_shift)) >> 6);
+                } else {
+                    next_cycle += (clock_cycle * abs(step_shift + swing_shift)) >> 6;
+                }
+            } else {
+                next_cycle = clock_cycle;
+            }
+        } else {
+            next_cycle = clockTimer.ticksRemain;
+            if (clock_phase) next_cycle += clockTimer.ticks;
+            if (step_shift + swing_shift < 0) {
+                next_cycle += (clockTimer.ticks << 1) - ((clockTimer.ticks * abs(step_shift + swing_shift)) >> 5);
+            } else {
+                next_cycle += (clockTimer.ticks * abs(step_shift + swing_shift)) >> 5;
+            }
+        }
     }
+	clockTimerB2.ticksRemain = clockTimerB2.ticks = next_cycle;
+	// can't handle shifting by full step, so nudge it a bit
+	if (total_shift == 64) clockTimerB2.ticksRemain--;
+	else if (total_shift == -64) clockTimerB2.ticksRemain++;
+	
+	if ((posB - w.wp[pattern].loop_start) & 1) {
+		timer_remove(&clockTimerB2_off);
+		timer_add(&clockTimerB2_off, clock_pulse_width, &clockTimerB2_off_callback, NULL);
+		arc_cvB(1, posB, 0);
+	}
 }
 
 void arc_cvA(u8 phase) {
     if (phase) {
-        cv0 = get_cv(pattern, pos, 0);
+        cv0 = get_cv(pattern, pos, 0, cv0);
         spi_selectChip(SPI,DAC_SPI);
         spi_write(SPI,0x31);	// update A
         spi_write(SPI,cv0>>4);
@@ -635,7 +814,7 @@ void arc_cvB(u8 phase, u8 pos, u8 isB1) {
     s8 tr2, tr3;
     tr2 = tr3 = -1;
     if (phase) {
-        cv1 = get_cv(pattern, pos, 1);
+        cv1 = get_cv(pattern, pos, 1, cv1);
         spi_selectChip(SPI,DAC_SPI);
         spi_write(SPI,0x38);	// update B
         spi_write(SPI,cv1>>4);
@@ -644,6 +823,8 @@ void arc_cvB(u8 phase, u8 pos, u8 isB1) {
         
 		tr2 = get_trigger(pattern, pos, 2);
 		tr3 = get_trigger(pattern, pos, 3);
+		posB_show = pos;
+		monomeFrameDirty++;
     } else {
         if(w.wp[pattern].tr_mode == 0) {
             tr2 = tr3 = 0;
@@ -655,11 +836,6 @@ void arc_cvB(u8 phase, u8 pos, u8 isB1) {
 	else
 		clock_onB2 = phase;
 
-	if (clock_onB1 || clock_onB2)
-		gpio_set_gpio_pin(B10);
-	else
-		gpio_clr_gpio_pin(B10);
-    
 	if (isB1) {
 		if (tr2 == 1) gate_onB1[0] = 1;
 		else if (tr2 == 0) gate_onB1[0] = 0;
@@ -672,6 +848,11 @@ void arc_cvB(u8 phase, u8 pos, u8 isB1) {
 		else if (tr3 == 0) gate_onB2[1] = 0;
 	}
 	
+	if (clock_onB1 || clock_onB2)
+		gpio_set_gpio_pin(B10);
+	else
+		gpio_clr_gpio_pin(B10);
+    
 	if (gate_onB1[0] || gate_onB2[0])
 		gpio_set_gpio_pin(B02);
 	else
@@ -683,25 +864,27 @@ void arc_cvB(u8 phase, u8 pos, u8 isB1) {
 		gpio_clr_gpio_pin(B03);
 }
 
-void arc_update_clocks() {
-    posB1 = arc_shift_pos(pos, -pos_shift);
-    next_posB1 = arc_shift_pos(next_pos, -pos_shift);
-    clockTimerB1.ticks = clockTimer.ticks << 1;
-    clockTimerB1.ticksRemain = clockTimer.ticksRemain;
-    if (clock_phase) clockTimerB1.ticksRemain += clockTimer.ticks;
-    // must be applied last
-    arc_shift_step(&clockTimerB1, step_shift, 0, &posB1, &next_posB1);
-    arc_update_clockB2();
+// calculates ticksRemain based on relative shift
+void arc_shift_step(softTimer_t* timer, s8 shift) {
+    u32 delta = (clock_cycle * abs(shift)) >> 6;
+    u32 ticks_x2 = timer->ticks << 1;
+    u32 tR = timer->ticksRemain;
+    if (shift < 0) {
+        if (delta < tR)
+            tR -= delta;
+        else
+            tR += ticks_x2 - delta;
+    } else if (shift > 0) {
+        u32 elapsed = ticks_x2 - tR;
+        if (delta <= elapsed)
+            tR += delta;
+        else
+            tR = delta - elapsed;
+    }
+    timer->ticksRemain = tR;
 }
 
-void arc_update_clockB2() {
-    posB2 = posB1;
-    next_posB2 = next_posB1;
-    clockTimerB2.ticks = clockTimerB1.ticks;
-    clockTimerB2.ticksRemain = clockTimerB1.ticksRemain;
-    arc_shift_step(&clockTimerB2, swing_shift, 1, &posB2, &next_posB2);
-}
-
+// returns position shifted by specified offset with proper wrapping around the sequence end
 s8 arc_shift_pos(s8 pos, s8 shift) {
     s8 shifted = pos;
     if (shift > 0) {
@@ -720,95 +903,110 @@ s8 arc_shift_pos(s8 pos, s8 shift) {
     return shifted;
 }
 
-void arc_shift_step(softTimer_t* timer, s8 shift_, u8 fix_phase, s8* pos, s8* next_pos) {
-    s8 shift = shift_;
-    u32 delta = (clockTimer.ticks * abs(shift)) >> 5;
-    u32 cycle_x2 = clockTimer.ticks << 1;
-    
-    if (fix_phase) {
-        if (swing_shift == 32) {
-            if (shift == 0) {
-                shift = -1;
-                delta = 1;
-            } else 
-                delta += shift > 0 ? -1 : 1;
-        } else if (swing_shift == -32) {
-            if (shift == 0) {
-                shift = 1;
-                delta = 1;
-            } else 
-                delta += shift > 0 ? 1 : -1;
-        }
-    }
-    
-    u32 tR = timer->ticksRemain;
-    if (shift < 0) {
-        if (delta < tR) {
-            tR -= delta;
-        } else {
-            *pos = arc_shift_pos(*pos, 1);
-            *next_pos = arc_shift_pos(*next_pos, 1);
-            tR += cycle_x2 - delta;
-        }
-    } else if (shift > 0) {
-        u32 elapsed = cycle_x2 - tR;
-        if (delta <= elapsed) {
-            tR += delta;
-        } else {
-            *pos = arc_shift_pos(*pos, -1);
-            *next_pos = arc_shift_pos(*next_pos, -1);
-            tR = delta - elapsed;
-        }
-    }
-    timer->ticksRemain = tR;
-}
-
-void arc_clock_speed_changed(void) {
-    if (speed_shift == 0) {
-        if (!clock_external) clock_pulse_width = clockTimer.ticks;
-        arc_update_clocks();
+// initialize clocks B using absolute values for current settings
+void arc_init_clocks() {
+    u32 ticksRemain;
+    if (clock_external) {
+        u64 ticks = ext_ticks + clock_cycle;
+        ticksRemain = ticks - 1 > tcTicks ? ticks - tcTicks : clock_cycle;
     } else {
-        clockTimerB1.ticks = (clockTimer.ticks << 1) - speed_shift;
-        if (!clock_external) clock_pulse_width = clockTimerB1.ticks >> 1;
-        arc_update_clockB2();
+        clock_cycle = clockTimer.ticks << 1;
+        clock_pulse_width = clockTimer.ticks;
+        ticksRemain = clock_phase ? clockTimer.ticksRemain + clockTimer.ticks : clockTimer.ticksRemain;
+    }
+    
+    if (speed_shift == 0) {
+		clockTimerB2.ticks = clockTimerB1.ticks = clock_cycle;
+		clockTimerB2.ticksRemain = clockTimerB1.ticksRemain = ticksRemain;
+		arc_shift_step(&clockTimerB1, step_shift);
+		arc_shift_step(&clockTimerB2, step_shift + swing_shift);
+    } else {
+        clockTimerB1.ticks = clock_cycle - 5 < speed_shift ? 5 : clock_cycle - speed_shift;
+		if (clockTimerB1.ticksRemain > clockTimerB1.ticks) clockTimerB1.ticksRemain = clockTimerB1.ticks;
+		clockTimerB2.ticks = clockTimerB1.ticks;
+		clockTimerB2.ticksRemain = clockTimerB1.ticksRemain;
+		arc_shift_step(&clockTimerB2, swing_shift);
     }
 }
 
 void arc_pos_shift_changed(s8 delta) {
-    posB1 = arc_shift_pos(posB1, -delta);
-    next_posB1 = arc_shift_pos(next_posB1, -delta);
-    posB2 = arc_shift_pos(posB2, -delta);
-    next_posB2 = arc_shift_pos(next_posB2, -delta);
+	pos_shift = (pos_shift + delta) % get_length(pattern);
+	monomeFrameDirty++;
 }
 
 void arc_step_shift_changed(s8 delta) {
-    arc_shift_step(&clockTimerB1, delta, 0, &posB1, &next_posB1);
-    arc_shift_step(&clockTimerB2, delta, 0, &posB2, &next_posB2);
+	u8 len = get_length(pattern);
+	if (delta > 0) {
+		if (step_shift < 32) {
+			step_shift++;
+		} else {
+			if (w.wp[pattern].step_mode == mForward) {
+				step_shift = -32;
+				pos_shift = (pos_shift + 1) % len;
+			} else if (w.wp[pattern].step_mode == mReverse) {
+				step_shift = -32;
+				pos_shift = pos_shift ? pos_shift - 1 : len - 1;
+			}
+		}
+	} else {
+		if (step_shift > -32) {
+			step_shift--;
+		} else {
+			if (w.wp[pattern].step_mode == mForward) {
+				step_shift = 32;
+				pos_shift = pos_shift ? pos_shift - 1 : len - 1;
+			} else if (w.wp[pattern].step_mode == mReverse) {
+				step_shift = 32;
+				pos_shift = (pos_shift + 1) % len;
+			}
+		}
+	}
+	arc_shift_step(&clockTimerB1, delta);
+	arc_shift_step(&clockTimerB2, delta);
+	monomeFrameDirty++;
 }
 
 void arc_swing_shift_changed(s8 delta) {
-    if (speed_shift == 0) {
-        if (abs(swing_shift) == 32) 
-            arc_update_clocks();
-        else {
-            arc_shift_step(&clockTimerB2, delta, 0, &posB2, &next_posB2);
-        }
-    } else {
-        if (abs(swing_shift) == 32)
-            arc_update_clockB2();
-        else
-            arc_shift_step(&clockTimerB2, delta, 0, &posB2, &next_posB2);
-    }
+	if (delta > 0) {
+		if (swing_shift < 32) {
+			swing_shift++;
+		}
+	} else {
+		if (swing_shift > -32) {
+			swing_shift--;
+		}
+	}
+	arc_shift_step(&clockTimerB2, delta);
+	monomeFrameDirty++;
 }
 
 void arc_speed_shift_changed(s8 delta) {
-    if (speed_shift == 0) {
-        arc_update_clocks();
-    } else {
-        clockTimerB1.ticks -= delta;
-        if (!clock_external) clock_pulse_width = clockTimerB1.ticks >> 1;
-        arc_update_clockB2();
-    }
+	if (delta > 0) {
+		if (speed_shift < 32) {
+			speed_shift++;
+		} 
+	} else {
+		if (speed_shift > -32) {
+			speed_shift--;
+		}
+	}
+
+	if (clock_external) return;
+	if (speed_shift)
+		clock_pulse_width = (clock_cycle - 5 < speed_shift ? 5 : clock_cycle - speed_shift) >> 1;
+	else
+		clock_pulse_width = clock_cycle >> 1;
+}
+
+void arc_clock_cycle_changed(u32 new_cycle) {
+	if (clock_cycle == new_cycle) return;
+	clock_cycle = new_cycle; // if (cycle < 5) cycle = 5;
+
+	if (clock_external) return;
+	if (speed_shift)
+		clock_pulse_width = (clock_cycle - 5 < speed_shift ? 5 : clock_cycle - speed_shift) >> 1;
+	else
+		clock_pulse_width = clock_cycle >> 1;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -832,10 +1030,7 @@ static void clockTimer_callback(void* o) {
 		clock_phase++;
 		if(clock_phase>1) clock_phase=0;
 		(*clock_pulse)(clock_phase);
-	} else if (is_arc_mode) {
-		clock_phase++;
-		if(clock_phase>1) clock_phase=0;
-    }
+	}
 }
 
 static void clockTimerB1_callback(void* o) {  
@@ -844,7 +1039,7 @@ static void clockTimerB1_callback(void* o) {
 
 static void clockTimerB1_off_callback(void* o) {
 	timer_remove(&clockTimerB1_off);
-	if(is_arc_mode) arc_cvB(0, posB1, 1);
+	if(is_arc_mode) arc_cvB(0, posB, 1);
 }
 
 static void clockTimerB2_callback(void* o) {  
@@ -853,7 +1048,7 @@ static void clockTimerB2_callback(void* o) {
 
 static void clockTimerB2_off_callback(void* o) {  
 	timer_remove(&clockTimerB2_off);
-	if(is_arc_mode) arc_cvB(0, posB2, 0);
+	if(is_arc_mode) arc_cvB(0, posB, 0);
 }
 
 static void keyTimer_callback(void* o) {  
@@ -948,16 +1143,16 @@ static void handler_MonomeConnect(s32 data) {
 
 void arc_setup(void) {
     if (!is_arc_mode) {
-        LENGTH = 15;
-        arc_clock_speed_changed();
         is_arc_mode = 1;
+        SIZE = 16;
+		LENGTH = 15;
+        arc_init_clocks();
     }
     monomeFrameDirty++;
 }
 
 void arc_cleanup(void) {
     if (is_arc_mode) {
-        next_pattern = pattern;
         is_arc_mode = 0;
     }
     monomeFrameDirty++;
@@ -1003,10 +1198,8 @@ static void handler_PollADC(s32 data) {
 		// print_dbg("\r\nnew clock (ms): ");
 		// print_dbg_ulong(clock_time);
 
-		if (!clock_external) {
-            timer_set(&clockTimer, clock_time);
-            arc_clock_speed_changed();
-        }
+		timer_set(&clockTimer, clock_time);
+		if (is_arc_mode && !clock_external) arc_clock_cycle_changed(clock_time << 1);
 	}
 	clock_temp = i;
 
@@ -1128,35 +1321,26 @@ static void handler_KeyTimer(s32 data) {
 static void handler_ClockNormal(s32 data) {
 	clock_external = !gpio_get_pin_value(B09); 
     
-    if (is_arc_mode && clock_external) {
-        ext_ticks = ext_ticks_pulse = 0;
-        clock_phase = 0;
-    }
+    if (is_arc_mode) {
+		if (clock_external) ext_ticks = ext_ticks_pulse = 0;
+		arc_init_clocks();
+	}
 }
 
 static void handler_ClockExt(s32 data) {
-	if (is_arc_mode) {
-		if (ext_ticks) {
-			if (data) {
-				u32 cycle = (tcTicks - ext_ticks) >> 1;
-				if (cycle == 0) cycle = 120;
-				if (clockTimer.ticks != cycle) {
-					clock_phase = 0;
-					clockTimer.ticks = cycle;
-					clockTimer.ticksRemain = 1;
-					arc_clock_speed_changed();
-				}
-				ext_ticks = ext_ticks_pulse = tcTicks;
-			} else {
-				clock_pulse_width = tcTicks - ext_ticks_pulse;
-				if (clock_pulse_width < 5) clock_pulse_width = 5;
-			}
+	clock(data);
+
+	if (ext_ticks) {
+		if (data) {
+			arc_clock_cycle_changed(tcTicks - ext_ticks);
+			ext_ticks = ext_ticks_pulse = tcTicks;
 		} else {
-			if (data) ext_ticks = ext_ticks_pulse = tcTicks;
+			clock_pulse_width = tcTicks - ext_ticks_pulse;
+			if (clock_pulse_width < 2) clock_pulse_width = 2;
 		}
+	} else {
+		if (data) ext_ticks = ext_ticks_pulse = tcTicks;
 	}
-	
-	clock(data); 
 }
 
 
@@ -1977,7 +2161,6 @@ static void handler_MonomeRingEnc(s32 data) {
 		return;
 	
 	encoder_delta[n] = 0;
-    
     switch (arc_page) {
         case ARC_PAGE_FADER:
             switch (n) {
@@ -2004,57 +2187,16 @@ static void handler_MonomeRingEnc(s32 data) {
         case ARC_PAGE_PHASE:
             switch (n) {
                 case 0:
-                    if (delta > 0) {
-                        if (pos_shift < 8) {
-                            pos_shift++;
-                            arc_pos_shift_changed(1);
-                        }
-                    } else {
-                        if (pos_shift > -8) {
-                            pos_shift--;
-                            arc_pos_shift_changed(-1);
-                        }
-                    }
+					arc_pos_shift_changed(delta < 0 ? -1 : 1);
                     break;
                 case 1:
-                    if (delta > 0) {
-                        if (step_shift < 32) {
-                            step_shift++;
-                            arc_step_shift_changed(1);
-                        }
-                    } else {
-                        if (step_shift > -32) {
-                            step_shift--;
-                            arc_step_shift_changed(-1);
-                        }
-                    }
+					arc_step_shift_changed(delta < 0 ? -1 : 1);
                     break;
                 case 2:
-                    if (delta > 0) {
-                        if (swing_shift < 32) {
-                            swing_shift++;
-                            arc_swing_shift_changed(1);
-                        }
-                    } else {
-                        if (swing_shift > -32) {
-                            swing_shift--;
-                            arc_swing_shift_changed(-1);
-                        }
-                    }
+					arc_swing_shift_changed(delta < 0 ? -1 : 1);
                     break;
                 case 3:
-                    if (delta > 0) {
-                        if (speed_shift < 32) {
-                            speed_shift++;
-                            arc_speed_shift_changed(1);
-                        } 
-                        
-                    } else {
-                        if (speed_shift > -32) {
-                            speed_shift--;
-                            arc_speed_shift_changed(-1);
-                        }
-                    }
+					arc_speed_shift_changed(delta < 0 ? -1 : 1);
                     break;
             }
             break;
@@ -2077,44 +2219,47 @@ static void handler_MonomeRingEnc(s32 data) {
 ////////////////////////////////////////////////////////////////////////////////
 // application grid redraw
 static void refresh_arc() {
-    for (u16 led = 0; led < 256; led++)
-    {
-        monomeLedBuffer[led] = 0;
-    }
+    for (u16 led = 0; led < 256; led++) monomeLedBuffer[led] = 0;
     
-    u8 l, p;
+    u8 p;
     switch (arc_page) {
         case ARC_PAGE_FADER:
-            l = pattern << 2;
-            monomeLedBuffer[l] = monomeLedBuffer[l+1] = monomeLedBuffer[l+2] = monomeLedBuffer[l+3] = 11;
-            for (u16 led = 64; led < 256; led++) {
-                monomeLedBuffer[led] = 0;
-            }
+            p = pattern << 2;
+            monomeLedBuffer[p] = monomeLedBuffer[p+1] = monomeLedBuffer[p+2] = monomeLedBuffer[p+3] = 11;
             break;
-        case ARC_PAGE_PHASE:
-            p = pos_shift < 0 ? 17 + pos_shift : pos_shift;
-            p = p << 2;
+
+		case ARC_PAGE_PHASE:
             for (u16 led = 0; led < 64; led++) {
-                if (!(led & 3)) monomeLedBuffer[led] = 15;
-                else monomeLedBuffer[led] = (led > p - 4 && led < p) ? 8 : 0;
+				p = led >> 2;
+				if ((w.wp[pattern].loop_start < w.wp[pattern].loop_end && p >= w.wp[pattern].loop_start && p <= w.wp[pattern].loop_end) ||
+					(w.wp[pattern].loop_start >= w.wp[pattern].loop_end && (p >= w.wp[pattern].loop_start || p <= w.wp[pattern].loop_end)))
+					monomeLedBuffer[led] = 2;
+				if(p == pos && (led & 3) == 1) monomeLedBuffer[led] = 9;
+				if(p == pos && (led & 3) == 3) monomeLedBuffer[led] = 9;
+				if(p == posB_show && (led & 3) == 2) monomeLedBuffer[led] = 9;
+				if (p == posB_show && p == pos) monomeLedBuffer[led] = 13;
+				if (!(led & 3)) monomeLedBuffer[led] = p == pos_shift ? 15 : 0;
                 
-                if (step_shift >= 0) {
-                    monomeLedBuffer[led+64] = led < step_shift ? 8 : 0;
+				if (step_shift >= 0) {
+                    monomeLedBuffer[led+64] = led < step_shift ? (led % 5 == 4 ? 15 : 6) : 0;
                 } else {
-                    monomeLedBuffer[led+64] = led >= 64 + step_shift ? 8 : 0;
-                }
-                if (swing_shift >= 0) {
-                    monomeLedBuffer[led+128] = led < swing_shift ? 8 : 0;
+                    monomeLedBuffer[led+64] = led >= 64 + step_shift ? ((63 - led) % 5 == 4 ? 15 : 6) : 0;
+				}
+
+				if (swing_shift >= 0) {
+                    monomeLedBuffer[led+128] = led < swing_shift ? (led % 5 == 4 ? 15 : 6) : 0;
                 } else {
-                    monomeLedBuffer[led+128] = led >= 64 + swing_shift ? 8 : 0;
-                }
+                    monomeLedBuffer[led+128] = led >= 64 + swing_shift ? ((63 - led) % 5 == 4 ? 15 : 6) : 0;
+				}
+				
                 if (speed_shift >= 0) {
                     monomeLedBuffer[led+192] = led < speed_shift ? 8 : 0;
                 } else {
                     monomeLedBuffer[led+192] = led >= 64 + speed_shift ? 8 : 0;
                 }
-            }        
+            }
             break;
+			
         case ARC_PAGE_SETTINGS:
             break;
     }
