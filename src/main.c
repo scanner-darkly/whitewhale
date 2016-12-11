@@ -698,6 +698,29 @@ void clock_arcB1() {
         }
     }
 	clockTimerB1.ticksRemain = clockTimerB1.ticks = next_cycle;
+	
+	if (speed_shift) {
+		if (clock_external) {
+			
+		} else {
+			u8 len = get_length(pattern);
+			if (clock_phase) {
+				u32 shift = ((clockTimer.ticks - clockTimer.ticksRemain) << 5) / clockTimer.ticks;
+				step_shift = shift;
+				if (w.wp[pattern].step_mode == mForward)
+					pos_shift = (len + pos - posB) % len;
+				else if (w.wp[pattern].step_mode == mReverse)
+					pos_shift = (len + posB - pos) % len;
+			} else {
+				u32 shift = (clockTimer.ticksRemain << 5) / clockTimer.ticks;
+				step_shift = -shift;
+				if (w.wp[pattern].step_mode == mForward)
+					pos_shift = (len + 1 + pos - posB) % len;
+				else if (w.wp[pattern].step_mode == mReverse)
+					pos_shift = (len + 1 + posB - pos) % len;
+			}
+		}
+	}
 
     if (!((posB - w.wp[pattern].loop_start) & 1)) {
 		timer_remove(&clockTimerB1_off);
@@ -921,7 +944,7 @@ void arc_init_clocks() {
 		arc_shift_step(&clockTimerB1, step_shift);
 		arc_shift_step(&clockTimerB2, step_shift + swing_shift);
     } else {
-        clockTimerB1.ticks = clock_cycle - 5 < speed_shift ? 5 : clock_cycle - speed_shift;
+        clockTimerB1.ticks = (s32)clock_cycle > (s32)speed_shift ? (s32)clock_cycle - speed_shift : 5;
 		if (clockTimerB1.ticksRemain > clockTimerB1.ticks) clockTimerB1.ticksRemain = clockTimerB1.ticks;
 		clockTimerB2.ticks = clockTimerB1.ticks;
 		clockTimerB2.ticksRemain = clockTimerB1.ticksRemain;
@@ -930,7 +953,14 @@ void arc_init_clocks() {
 }
 
 void arc_pos_shift_changed(s8 delta) {
-	pos_shift = (pos_shift + delta) % get_length(pattern);
+	u8 len = get_length(pattern);
+	if (speed_shift) {
+		if (w.wp[pattern].step_mode == mForward)
+			posB = arc_shift_pos(posB, -delta);
+		else if(w.wp[pattern].step_mode == mReverse)
+			posB = arc_shift_pos(posB, delta);
+	}
+	pos_shift = (pos_shift + len + delta) % len;
 	monomeFrameDirty++;
 }
 
@@ -993,7 +1023,7 @@ void arc_speed_shift_changed(s8 delta) {
 
 	if (clock_external) return;
 	if (speed_shift)
-		clock_pulse_width = (clock_cycle - 5 < speed_shift ? 5 : clock_cycle - speed_shift) >> 1;
+		clock_pulse_width = (s32)clock_cycle - 2 < (s32)speed_shift ? 2 : (clock_cycle - speed_shift) >> 1;
 	else
 		clock_pulse_width = clock_cycle >> 1;
 }
@@ -1004,7 +1034,7 @@ void arc_clock_cycle_changed(u32 new_cycle) {
 
 	if (clock_external) return;
 	if (speed_shift)
-		clock_pulse_width = (clock_cycle - 5 < speed_shift ? 5 : clock_cycle - speed_shift) >> 1;
+		clock_pulse_width = (s32)clock_cycle - 2 < (s32)speed_shift ? 2 : (clock_cycle - speed_shift) >> 1;
 	else
 		clock_pulse_width = clock_cycle >> 1;
 }
@@ -2234,10 +2264,9 @@ static void refresh_arc() {
 				if ((w.wp[pattern].loop_start < w.wp[pattern].loop_end && p >= w.wp[pattern].loop_start && p <= w.wp[pattern].loop_end) ||
 					(w.wp[pattern].loop_start >= w.wp[pattern].loop_end && (p >= w.wp[pattern].loop_start || p <= w.wp[pattern].loop_end)))
 					monomeLedBuffer[led] = 2;
-				if(p == pos && (led & 3) == 1) monomeLedBuffer[led] = 9;
-				if(p == pos && (led & 3) == 3) monomeLedBuffer[led] = 9;
-				if(p == posB_show && (led & 3) == 2) monomeLedBuffer[led] = 9;
-				if (p == posB_show && p == pos) monomeLedBuffer[led] = 13;
+				if(p == pos) monomeLedBuffer[led] = 9;
+				if(p == posB_show) monomeLedBuffer[led] = 5;
+				if (p == posB_show && p == pos) monomeLedBuffer[led] = 14;
 				if (!(led & 3)) monomeLedBuffer[led] = p == pos_shift ? 15 : 0;
                 
 				if (step_shift >= 0) {
