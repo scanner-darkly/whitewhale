@@ -807,11 +807,11 @@ void clock_arcB2() {
 void arc_cvA(u8 phase) {
     if (phase) {
         cv0 = get_cv(pattern, pos, 0, cv0);
-        spi_selectChip(SPI,DAC_SPI);
-        spi_write(SPI,0x31);	// update A
-        spi_write(SPI,cv0>>4);
-        spi_write(SPI,cv0<<4);
-        spi_unselectChip(SPI,DAC_SPI);
+        spi_selectChip(DAC_SPI,DAC_SPI_NPCS);
+        spi_write(DAC_SPI,0x31); // update A
+        spi_write(DAC_SPI,cv0>>4);
+        spi_write(DAC_SPI,cv0<<4);
+        spi_unselectChip(DAC_SPI,DAC_SPI_NPCS);
         
         s8 trig;
 		trig = get_trigger(pattern, pos, 0);
@@ -838,11 +838,11 @@ void arc_cvB(u8 phase, u8 pos, u8 isB1) {
     tr2 = tr3 = -1;
     if (phase) {
         cv1 = get_cv(pattern, pos, 1, cv1);
-        spi_selectChip(SPI,DAC_SPI);
-        spi_write(SPI,0x38);	// update B
-        spi_write(SPI,cv1>>4);
-        spi_write(SPI,cv1<<4);
-        spi_unselectChip(SPI,DAC_SPI);
+        spi_selectChip(DAC_SPI,DAC_SPI_NPCS);
+        spi_write(DAC_SPI,0x38); // update B
+        spi_write(DAC_SPI,cv1>>4);
+        spi_write(DAC_SPI,cv1<<4);
+        spi_unselectChip(SPI,DAC_SPI_NPCS);
         
 		tr2 = get_trigger(pattern, pos, 2);
 		tr3 = get_trigger(pattern, pos, 3);
