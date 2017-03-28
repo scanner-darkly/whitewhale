@@ -29,6 +29,7 @@
 #include "adc.h"
 #include "util.h"
 #include "ftdi.h"
+#include "synced_clock.h"	
 
 // this
 #include "conf_board.h"
@@ -70,7 +71,7 @@ const u16 SCALES[24][16] = {
 };
 
 typedef enum {
-	mTrig, mMap, mSeries
+	mTrig, mMap, mSeries, mClock
 } edit_modes;
 
 typedef enum {
@@ -89,6 +90,7 @@ typedef struct {
 	u16 cv_steps[2][16];
 	u16 cv_curves[2][16];
 	u8 cv_probs[2][16];
+	sc_config sc_conf;
 } whale_pattern;
 
 typedef struct {
@@ -97,6 +99,9 @@ typedef struct {
 	u8 series_start, series_end;
 	u8 tr_mute[4];
 	u8 cv_mute[2];
+	u8 direct_clock;
+	u8 keep_tempo;
+	u8 keep_div_mult;
 } whale_set;
 
 typedef const struct {
@@ -134,8 +139,11 @@ u16 clip;
 u16 *param_dest;
 u8 quantize_in;
 
-u8 clock_phase;
 u16 clock_time, clock_temp;
+synced_clock sclock;
+u8 clock_enabled;
+volatile u8 clock_on = 0;
+
 u8 series_step;
 
 u16 adc[4];
@@ -159,6 +167,7 @@ static void refresh(void);
 static void refresh_mono(void);
 static void refresh_preset(void);
 static void clock(u8 phase);
+static void update_synced_clock(u8 is_series, u8 is_synced);
 
 // start/stop monome polling/refresh timers
 extern void timers_set_monome(void);
@@ -173,6 +182,7 @@ static void handler_KeyTimer(s32 data);
 static void handler_Front(s32 data);
 static void handler_ClockNormal(s32 data);
 static void handler_ClockExt(s32 data);
+static void synced_clock_callback(void);
 
 static void ww_process_ii(uint8_t *data, uint8_t l);
 
@@ -202,6 +212,7 @@ void clock(u8 phase) {
 			pattern = next_pattern;
 			next_pos = w.wp[pattern].loop_start;
 			pattern_jump = 0;
+			update_synced_clock(false, true);
 		}
 		// for series mode and delayed pattern change
 		if(series_jump) {
@@ -243,6 +254,7 @@ void clock(u8 phase) {
 
 			series_jump = 0;
 			series_step = 0;
+			update_synced_clock(true, true);
 		}
 
 		pos = next_pos;
@@ -446,6 +458,12 @@ void clock(u8 phase) {
 	// print_dbg_ulong(pos);
 }
 
+void update_synced_clock(u8 is_series, u8 is_synced) {
+	if (is_series)
+		sc_load_config(&sclock, &w.wp[pattern].sc_conf, !w.keep_tempo, !w.keep_div_mult, is_synced);
+	else
+		sc_load_config(&sclock, &w.wp[pattern].sc_conf, true, true, is_synced);
+}
 
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -456,7 +474,9 @@ static softTimer_t keyTimer = { .next = NULL, .prev = NULL };
 static softTimer_t adcTimer = { .next = NULL, .prev = NULL };
 static softTimer_t monomePollTimer = { .next = NULL, .prev = NULL };
 static softTimer_t monomeRefreshTimer  = { .next = NULL, .prev = NULL };
-
+static softTimer_t synced_clock_off_timer = { .next = NULL, .prev = NULL };
+static softTimer_t synced_clock_off_timer2 = { .next = NULL, .prev = NULL };
+static softTimer_t synced_clock_off_timer3 = { .next = NULL, .prev = NULL };
 
 
 static void clockTimer_callback(void* o) {  
@@ -465,11 +485,8 @@ static void clockTimer_callback(void* o) {
 	// e.data = 0;
 	// event_post(&e);
 	if(clock_external == 0) {
-		// print_dbg("\r\ntimer.");
-
-		clock_phase++;
-		if(clock_phase>1) clock_phase=0;
-		(*clock_pulse)(clock_phase);
+		sc_process_tap(&sclock, tcTicks);
+		sc_save_config(&sclock, &w.wp[pattern].sc_conf);
 	}
 }
 
@@ -663,6 +680,9 @@ static void handler_KeyTimer(s32 data) {
 						w.wp[x].cv_steps[1][n1] = w.wp[pattern].cv_steps[1][n1];
 						w.wp[x].cv_curves[1][n1] = w.wp[pattern].cv_curves[1][n1];
 						w.wp[x].cv_probs[1][n1] = w.wp[pattern].cv_probs[1][n1];
+						w.wp[x].sc_conf.div = w.wp[pattern].sc_conf.div;
+						w.wp[x].sc_conf.mult = w.wp[pattern].sc_conf.mult;
+						w.wp[x].sc_conf.period = w.wp[pattern].sc_conf.period;
 					}
 
 					w.wp[x].cv_mode[0] = w.wp[pattern].cv_mode[0];
@@ -678,6 +698,7 @@ static void handler_KeyTimer(s32 data) {
 
 					pattern = x;
 					next_pattern = x;
+					update_synced_clock(false, false);
 					monomeFrameDirty++;
 
 					// print_dbg("\r\n saved pattern: ");
@@ -706,7 +727,39 @@ static void handler_ClockNormal(s32 data) {
 }
 
 static void handler_ClockExt(s32 data) {
-	clock(data); 
+	if (data) {
+		sc_process_tap(&sclock, tcTicks);
+		sc_save_config(&sclock, &w.wp[pattern].sc_conf);
+	}
+	if (w.direct_clock) clock(data);
+}
+
+static void synced_clock_off_callback(void* o) {
+	timer_remove(&synced_clock_off_timer);
+	clock(0);
+}
+
+static void synced_clock_off_callback2(void* o) {
+	timer_remove(&synced_clock_off_timer2);
+	clock_on = 0;
+	if (edit_mode == mClock) (*re)();
+}
+
+static void synced_clock_off_callback3(void* o) {
+	timer_remove(&synced_clock_off_timer3);
+	if (w.direct_clock) clock(0);
+}
+
+static void synced_clock_callback(void) {
+	clock_on = 1;
+	if (edit_mode == mClock) (*re)();
+	timer_remove(&synced_clock_off_timer);
+	timer_add(&synced_clock_off_timer, 10, &synced_clock_off_callback, NULL);
+	timer_remove(&synced_clock_off_timer2);
+	timer_add(&synced_clock_off_timer2, 40, &synced_clock_off_callback2, NULL);
+
+	if (!clock_enabled || (w.direct_clock && clock_external)) return;
+	clock(1);
 }
 
 
@@ -753,6 +806,7 @@ static void handler_MonomeGridKey(s32 data) {
 					else {
 						pattern = i1;
 						next_pattern = i1;
+						update_synced_clock(false, false);
 					}
 				}
 			}
@@ -865,6 +919,9 @@ static void handler_MonomeGridKey(s32 data) {
 				if(z == 0) {
 					param_accept = 0;
 					live_in = 0;
+				} else if (key_meta) {
+					if (edit_mode == mSeries) update_synced_clock(false, false);
+					edit_mode = mClock;
 				}
 				monomeFrameDirty++;
 			}
@@ -873,8 +930,10 @@ static void handler_MonomeGridKey(s32 data) {
 					w.wp[pattern].tr_mode ^= 1;
 				else if(key_meta)
 					w.tr_mute[x] ^= 1;
-				else 
+				else {
+					if (edit_mode == mSeries) update_synced_clock(false, false);
 					edit_mode = mTrig;
+				}
 				edit_prob = 0;
 				param_accept = 0;
 				monomeFrameDirty++;
@@ -888,14 +947,17 @@ static void handler_MonomeGridKey(s32 data) {
 					w.wp[pattern].cv_mode[edit_cv_ch] ^= 1;
 				else if(key_meta)
 					w.cv_mute[edit_cv_ch] ^= 1;
-				else
+				else {
+					if (edit_mode == mSeries) update_synced_clock(false, false);
 					edit_mode = mMap;
+				}
 
 				monomeFrameDirty++;
 			}
 			else if(SIZE==8 && (x == 4 || x == 5) && z) {
 				param_accept = 0;
 				edit_cv_ch = x-4;
+				if (edit_mode == mSeries) update_synced_clock(false, false);
 				edit_mode = mMap;
 				edit_prob = 0;
 
@@ -910,8 +972,18 @@ static void handler_MonomeGridKey(s32 data) {
 				edit_mode = mSeries;
 				monomeFrameDirty++;
 			}
-			else if(x == LENGTH-1)
+			else if(x == LENGTH-1) {
 				key_meta = z;
+			}
+			else if(x == LENGTH-2 && z) {
+				if (edit_mode == mSeries) update_synced_clock(false, false);
+				edit_mode = mClock;
+				monomeFrameDirty++;
+			}
+			else if(x == LENGTH-3 && z) {
+				clock_enabled = !clock_enabled;
+				monomeFrameDirty++;
+			}
 		}
 
 
@@ -1227,6 +1299,43 @@ static void handler_MonomeGridKey(s32 data) {
 
 			monomeFrameDirty++;
 		}
+
+		// clock settings
+		else if(edit_mode == mClock) {
+			if (!z) return;
+			
+			switch (y) {
+				case 3:
+					// reserved
+					break;
+				case 4:
+					// reserved
+					break;
+				case 5:
+					sc_update_div(&sclock, x + 1);
+					sc_save_config(&sclock, &w.wp[pattern].sc_conf);
+					break;
+				case 6:
+					sc_update_mult(&sclock, x + 1);
+					sc_save_config(&sclock, &w.wp[pattern].sc_conf);
+					break;
+				case 7:
+					if (x == 0) {
+						w.keep_tempo = !w.keep_tempo;
+					} else if (x == 1) {
+						w.keep_div_mult = !w.keep_div_mult;
+					} else if (x == LENGTH-2) {
+						sc_process_tap(&sclock, tcTicks);
+						sc_save_config(&sclock, &w.wp[pattern].sc_conf);
+					} else if (x == LENGTH-1) {
+						w.direct_clock = !w.direct_clock;
+					} else if (x == LENGTH) {
+						clock_enabled = !clock_enabled;
+					}
+					break;
+			}
+			monomeFrameDirty++;
+		}
 	}
 }
 
@@ -1268,6 +1377,12 @@ static void refresh() {
 	// alt
 	monomeLedBuffer[LENGTH] = 4;
 	if(key_alt) monomeLedBuffer[LENGTH] = 11;
+	
+	// clock settings
+	if(SIZE==16) {
+		monomeLedBuffer[LENGTH-2] = edit_mode == mClock ? 11 : 0;
+		monomeLedBuffer[LENGTH-3] = clock_enabled ? 11 : 4;
+	}
 
 	// show mutes or on steps
 	if(key_meta) {
@@ -1502,6 +1617,22 @@ static void refresh() {
 		}
 	}
 
+	// clock settings
+	else if(edit_mode == mClock) {
+		for(i1=0;i1<SIZE;i1++) {
+			monomeLedBuffer[i1+48] = 0;
+			monomeLedBuffer[i1+64] = 0;
+			monomeLedBuffer[i1+80] = i1 < sclock.conf.div ? 11 : 2;
+			monomeLedBuffer[i1+96] = i1 < sclock.conf.mult ? 11 : 2;
+			monomeLedBuffer[i1+112] = 0;
+		}
+		monomeLedBuffer[112] = w.keep_tempo ? 11 : 4;
+		monomeLedBuffer[113] = w.keep_div_mult ? 11 : 4;
+		monomeLedBuffer[110+LENGTH] = clock_on ? 11 : 4;
+		monomeLedBuffer[111+LENGTH] = w.direct_clock ? 11 : 4;
+		monomeLedBuffer[112+LENGTH] = clock_enabled ? 11 : 4;
+	}
+
 	monome_set_quadrant_flag(0);
 	monome_set_quadrant_flag(1);
 }
@@ -1565,6 +1696,12 @@ static void refresh_mono() {
 
 	// alt
 	if(key_alt) monomeLedBuffer[LENGTH] = 11;
+
+	// clock settings
+	if(SIZE==16) {
+		monomeLedBuffer[LENGTH-2] = edit_mode == mClock ? 11 : 0;
+		monomeLedBuffer[LENGTH-3] = clock_enabled ? 11 : 4;
+	}
 
 	// show position
 	monomeLedBuffer[16+pos] = 15;
@@ -1728,6 +1865,22 @@ static void refresh_mono() {
 		}
 	}
 
+	// clock settings
+	else if(edit_mode == mClock) {
+		for(i1=0;i1<SIZE;i1++) {
+			monomeLedBuffer[i1+48] = 0;
+			monomeLedBuffer[i1+64] = 0;
+			monomeLedBuffer[i1+80] = i1 < sclock.conf.div ? 11 : 2;
+			monomeLedBuffer[i1+96] = i1 < sclock.conf.mult ? 11 : 2;
+			monomeLedBuffer[i1+112] = 0;
+		}
+		monomeLedBuffer[112] = w.keep_tempo ? 11 : 4;
+		monomeLedBuffer[113] = w.keep_div_mult ? 11 : 4;
+		monomeLedBuffer[110+LENGTH] = clock_on ? 11 : 4;
+		monomeLedBuffer[111+LENGTH] = w.direct_clock ? 11 : 4;
+		monomeLedBuffer[112+LENGTH] = clock_enabled ? 11 : 4;
+	}
+
 	monome_set_quadrant_flag(0);
 	monome_set_quadrant_flag(1);
 }
@@ -1785,9 +1938,12 @@ static void ww_process_ii(uint8_t *data, uint8_t l) {
 				break;
 			next_pos = d;
 			cut_pos++;
-			timer_set(&clockTimer,clock_time);
-			clock_phase = 1;
-			(*clock_pulse)(clock_phase);
+			sc_process_tap(&sclock, tcTicks);
+			sc_save_config(&sclock, &w.wp[pattern].sc_conf);
+			if (w.direct_clock) {
+				timer_add(&synced_clock_off_timer3, 10, &synced_clock_off_callback3, NULL);
+				clock(1);
+			}
 			break;
 		case WW_START:
 			if(d<0 || d>15)
@@ -1827,6 +1983,7 @@ static void ww_process_ii(uint8_t *data, uint8_t l) {
 				break;
  			pattern = d;
 			next_pattern = d;
+			update_synced_clock(edit_mode == mSeries, false);
 			monomeFrameDirty++;
  			break;
  		case WW_QPATTERN:
@@ -1947,6 +2104,10 @@ void flash_read(void) {
 		w.wp[i1].cv_mode[0] = flashy.w[preset_select].wp[i1].cv_mode[0];
 		w.wp[i1].cv_mode[1] = flashy.w[preset_select].wp[i1].cv_mode[1];
 		w.wp[i1].tr_mode = flashy.w[preset_select].wp[i1].tr_mode;
+		
+		w.wp[i1].sc_conf.div = flashy.w[preset_select].wp[i1].sc_conf.div;
+		w.wp[i1].sc_conf.mult = flashy.w[preset_select].wp[i1].sc_conf.mult;
+		w.wp[i1].sc_conf.period = flashy.w[preset_select].wp[i1].sc_conf.period;
 	}
 
 	w.series_start = flashy.w[preset_select].series_start;
@@ -1958,6 +2119,10 @@ void flash_read(void) {
 	w.tr_mute[3] = flashy.w[preset_select].tr_mute[3];
 	w.cv_mute[0] = flashy.w[preset_select].cv_mute[0];
 	w.cv_mute[1] = flashy.w[preset_select].cv_mute[1];
+	
+	w.direct_clock = flashy.w[preset_select].direct_clock;
+	w.keep_tempo = flashy.w[preset_select].keep_tempo;
+	w.keep_div_mult = flashy.w[preset_select].keep_div_mult;
 
 	for(i1=0;i1<64;i1++)
 		w.series_list[i1] = flashy.w[preset_select].series_list[i1];
@@ -2034,6 +2199,10 @@ int main(void)
 			w.wp[i1].cv_mode[0] = 0;
 			w.wp[i1].cv_mode[1] = 0;
 			w.wp[i1].tr_mode = 0;
+
+			w.wp[i1].sc_conf.div = 1;
+			w.wp[i1].sc_conf.mult = 1;
+			w.wp[i1].sc_conf.period = 400;
 		}
 
 		w.series_start = 0;
@@ -2046,9 +2215,13 @@ int main(void)
 		w.cv_mute[0] = 1;
 		w.cv_mute[1] = 1;
 
+		w.direct_clock = false;
+		w.keep_tempo = false;
+		w.keep_div_mult = false;
+		
 		for(i1=0;i1<64;i1++)
 			w.series_list[i1] = 1;
-
+		
 		// save all presets, clear glyphs
 		for(i1=0;i1<8;i1++) {
 			flashc_memcpy((void *)&flashy.w[i1], &w, sizeof(w), true);
@@ -2080,6 +2253,10 @@ int main(void)
 	timer_add(&adcTimer,100,&adcTimer_callback, NULL);
 	clock_temp = 10000; // out of ADC range to force tempo
 
+	clock_enabled = true;
+	sc_init(&sclock, &w.wp[pattern].sc_conf, &synced_clock_callback);
+	monomeFrameDirty++;
+	
 	// setup daisy chain for two dacs
 	// spi_selectChip(SPI,DAC_SPI);
 	// spi_write(SPI,0x80);

@@ -63,6 +63,7 @@ TARGET = $(THIS).elf
 # List of C source files.
 CSRCS = \
        ../src/main.c    \
+       ../src/synced_clock.c    \
        ../libavr32/src/adc.c     \
        ../libavr32/src/events.c     \
        ../libavr32/src/i2c.c     \
