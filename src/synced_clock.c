@@ -112,8 +112,8 @@ void sc_init(synced_clock* sc, sc_config* conf, sc_callback_t callback) {
 	sc_heartbeat_callback((void *)sc);
 }
 
-void sc_load_config(synced_clock* sc, sc_config* conf, u8 update_period, u8 update_div_mult, u8 synced) {
-	u32 pos = synced ? 0 : sc_get_position(sc);
+void sc_load_config(synced_clock* sc, sc_config* conf, u8 update_period, u8 update_div_mult, u8 from_clock) {
+	u32 pos = from_clock ? 0 : sc_get_position(sc);
 	if (update_div_mult) {
 		sc->conf.div = conf->div ? conf->div : 1;
 		sc->conf.mult = conf->mult ? conf->mult : 1;
@@ -125,7 +125,10 @@ void sc_load_config(synced_clock* sc, sc_config* conf, u8 update_period, u8 upda
 	if (update_div_mult || update_period) {
 		sc->ext_index = sc->int_index = 0;
 		sc_recalculate_intervals(sc);
-		sc_adjust_position(sc, pos);
+		if (from_clock)
+			sc->heartbeat.ticksRemain = sc->intervals[sc->int_index];
+		else
+			sc_adjust_position(sc, pos);
 	}
 }
 

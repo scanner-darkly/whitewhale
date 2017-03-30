@@ -102,6 +102,7 @@ typedef struct {
 	u8 direct_clock;
 	u8 keep_tempo;
 	u8 keep_div_mult;
+	u8 reset_after_stop;
 } whale_set;
 
 typedef const struct {
@@ -982,6 +983,7 @@ static void handler_MonomeGridKey(s32 data) {
 			}
 			else if(x == LENGTH-3 && z) {
 				clock_enabled = !clock_enabled;
+				if (clock_enabled && w.reset_after_stop) next_pos = w.wp[pattern].loop_start;
 				monomeFrameDirty++;
 			}
 		}
@@ -1324,6 +1326,8 @@ static void handler_MonomeGridKey(s32 data) {
 						w.keep_tempo = !w.keep_tempo;
 					} else if (x == 1) {
 						w.keep_div_mult = !w.keep_div_mult;
+					} else if (x == 2) {
+						w.reset_after_stop = !w.reset_after_stop;
 					} else if (x == LENGTH-2) {
 						sc_process_tap(&sclock, tcTicks);
 						sc_save_config(&sclock, &w.wp[pattern].sc_conf);
@@ -1331,6 +1335,7 @@ static void handler_MonomeGridKey(s32 data) {
 						w.direct_clock = !w.direct_clock;
 					} else if (x == LENGTH) {
 						clock_enabled = !clock_enabled;
+						if (clock_enabled && w.reset_after_stop) next_pos = w.wp[pattern].loop_start;
 					}
 					break;
 			}
@@ -1628,6 +1633,7 @@ static void refresh() {
 		}
 		monomeLedBuffer[112] = w.keep_tempo ? 11 : 4;
 		monomeLedBuffer[113] = w.keep_div_mult ? 11 : 4;
+		monomeLedBuffer[114] = w.reset_after_stop ? 11 : 4;
 		monomeLedBuffer[110+LENGTH] = clock_on ? 11 : 4;
 		monomeLedBuffer[111+LENGTH] = w.direct_clock ? 11 : 4;
 		monomeLedBuffer[112+LENGTH] = clock_enabled ? 11 : 4;
@@ -1876,6 +1882,7 @@ static void refresh_mono() {
 		}
 		monomeLedBuffer[112] = w.keep_tempo ? 11 : 4;
 		monomeLedBuffer[113] = w.keep_div_mult ? 11 : 4;
+		monomeLedBuffer[114] = w.reset_after_stop ? 11 : 4;
 		monomeLedBuffer[110+LENGTH] = clock_on ? 11 : 4;
 		monomeLedBuffer[111+LENGTH] = w.direct_clock ? 11 : 4;
 		monomeLedBuffer[112+LENGTH] = clock_enabled ? 11 : 4;
@@ -2123,6 +2130,7 @@ void flash_read(void) {
 	w.direct_clock = flashy.w[preset_select].direct_clock;
 	w.keep_tempo = flashy.w[preset_select].keep_tempo;
 	w.keep_div_mult = flashy.w[preset_select].keep_div_mult;
+	w.reset_after_stop = flashy.w[preset_select].reset_after_stop;
 
 	for(i1=0;i1<64;i1++)
 		w.series_list[i1] = flashy.w[preset_select].series_list[i1];
@@ -2218,6 +2226,7 @@ int main(void)
 		w.direct_clock = false;
 		w.keep_tempo = false;
 		w.keep_div_mult = false;
+		w.reset_after_stop = false;
 		
 		for(i1=0;i1<64;i1++)
 			w.series_list[i1] = 1;

@@ -31,7 +31,7 @@ typedef volatile struct {
 } synced_clock;
 
 void sc_init(synced_clock* sc, sc_config* conf, sc_callback_t callback);
-void sc_load_config(synced_clock* sc, sc_config* conf, u8 update_period, u8 update_div_mult, u8 synced);
+void sc_load_config(synced_clock* sc, sc_config* conf, u8 update_period, u8 update_div_mult, u8 from_clock);
 void sc_save_config(synced_clock* sc, sc_config* conf);
 void sc_process_tap(synced_clock* sc, u64 tick);
 void sc_update_div(synced_clock* sc, u8 div);
