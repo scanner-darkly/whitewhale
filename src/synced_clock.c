@@ -10,8 +10,7 @@ static u32 sc_get_position(synced_clock* sc);
 static void sc_heartbeat_callback(void* o) {
 	synced_clock* sc = o;
 	if (++sc->int_index >= sc->conf.mult) sc->int_index = 0;
-	timer_remove(&sc->heartbeat);
-	timer_add(&sc->heartbeat, sc->intervals[sc->int_index], &sc_heartbeat_callback, (void *)sc);
+	timer_reset_set(&sc->heartbeat, sc->intervals[sc->int_index]);
 	(*(sc->callback))();
 }
 
@@ -40,6 +39,7 @@ static void sc_recalculate_intervals(synced_clock* sc) {
 		acc += sc->intervals[i];
 	}
 	sc->intervals[sc->conf.mult - 1] += total - acc;
+	for (u8 i = sc->conf.mult; i < SC_MAXMULT; i++) sc->intervals[i] = sc->intervals[0];
 }
 
 static void sc_adjust_position(synced_clock* sc, u32 position) {
@@ -90,6 +90,8 @@ void sc_update_div(synced_clock* sc, u8 div) {
 void sc_update_mult(synced_clock* sc, u8 mult) {
 	u32 pos = sc_get_position(sc);
 	sc->conf.mult = mult ? mult : 1;
+	if (sc->conf.mult > SC_MAXMULT) sc->conf.mult = SC_MAXMULT;
+	if (sc->int_index >= sc->conf.mult) sc->int_index = 0;
 	sc_recalculate_intervals(sc);
 	sc_adjust_position(sc, pos);
 }
