@@ -15,8 +15,6 @@ static void sc_heartbeat_callback(void* o) {
 	u8 irq_flags = irqs_pause();
 	
 	if ((get_ticks() - sc->last_heartbeat) < sc->quarter) {
-		sc_debug2 = get_ticks() - sc->last_heartbeat;
-		sc_debug1 = 0b111111111111;
 		irqs_resume(irq_flags);
 		return;
 	}
@@ -100,8 +98,6 @@ static void sc_adjust_position(synced_clock* sc, u32 position) {
 		sc->heartbeat.ticksRemain = remaining;
 	}
 	irqs_resume(irq_flags);
-	
-	(*(sc_notify))();
 }
 	
 static u32 sc_get_position(synced_clock* sc) {
@@ -144,8 +140,6 @@ void sc_update_mult(synced_clock* sc, u8 mult) {
 }
 
 void sc_init(synced_clock* sc, sc_config* conf, sc_callback_t callback) {
-	sc_debug1 = sc_debug2 = 0;
-	
 	sc->conf.div = conf->div ? conf->div : 1;
 	sc->conf.mult = conf->mult ? conf->mult : 1;
 	sc->conf.period = conf->period;
@@ -166,8 +160,6 @@ void sc_init(synced_clock* sc, sc_config* conf, sc_callback_t callback) {
 }
 
 void sc_load_config(synced_clock* sc, sc_config* conf, u8 update_period, u8 update_div_mult, u8 from_clock) {
-	sc_debug1 = sc_debug2 = 0;
-
 	u32 pos = from_clock ? 0 : sc_get_position(sc);
 	if (update_div_mult) {
 		sc->conf.div = conf->div ? conf->div : 1;

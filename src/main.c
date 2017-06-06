@@ -184,7 +184,6 @@ static void handler_Front(s32 data);
 static void handler_ClockNormal(s32 data);
 static void handler_ClockExt(s32 data);
 static void synced_clock_callback(void);
-static void synced_clock_notify(void);
 
 static void ww_process_ii(uint8_t *data, uint8_t l);
 
@@ -479,7 +478,6 @@ static softTimer_t monomeRefreshTimer  = { .next = NULL, .prev = NULL };
 static softTimer_t synced_clock_off_timer = { .next = NULL, .prev = NULL };
 static softTimer_t synced_clock_off_timer2 = { .next = NULL, .prev = NULL };
 static softTimer_t clock_off_wwsync_timer = { .next = NULL, .prev = NULL };
-static softTimer_t sclock_notify_timer = { .next = NULL, .prev = NULL };
 
 
 static void clockTimer_callback(void* o) {  
@@ -763,22 +761,6 @@ static void synced_clock_callback(void) {
 	clock(1);
 	timer_remove(&synced_clock_off_timer);
 	timer_add(&synced_clock_off_timer, 10, &synced_clock_off_callback, NULL);
-}
-
-static void sclock_notify_callback(void* o) {
-	timer_remove(&sclock_notify_timer);
-	monomeLedBuffer[63] = 0;
-	monomeFrameDirty = 0b1111;
-}
-
-static void synced_clock_notify(void) {
-	for(u8 i1=0;i1<SIZE;i1++) {
-		monomeLedBuffer[i1+48] = sc_debug1 & (1 << i1) ? 4 : 0;
-		monomeLedBuffer[i1+64] = sc_debug2 & (1 << i1) ? 4 : 0;
-	}
-	monomeLedBuffer[63] = 4;
-	monomeFrameDirty = 0b1111;
-	timer_add(&sclock_notify_timer, 60, &sclock_notify_callback, NULL);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1372,7 +1354,7 @@ static void refresh() {
 		monomeLedBuffer[i1] = 0;
 		monomeLedBuffer[16+i1] = 0;
 		monomeLedBuffer[32+i1] = 4;
-		//monomeLedBuffer[48+i1] = 0;
+		monomeLedBuffer[48+i1] = 0;
 	}
 
 	// dim mode
@@ -1642,8 +1624,8 @@ static void refresh() {
 	// clock settings
 	else if(edit_mode == mClock) {
 		for(i1=0;i1<SIZE;i1++) {
-			//monomeLedBuffer[i1+48] = 0;
-			//monomeLedBuffer[i1+64] = 0;
+			monomeLedBuffer[i1+48] = 0;
+			monomeLedBuffer[i1+64] = 0;
 			monomeLedBuffer[i1+80] = i1 < sclock.conf.div ? 11 : 2;
 			monomeLedBuffer[i1+96] = i1 < sclock.conf.mult ? 11 : 2;
 			monomeLedBuffer[i1+112] = 0;
@@ -2281,7 +2263,6 @@ int main(void)
 
 	clock_enabled = true;
 	sc_init(&sclock, &w.wp[pattern].sc_conf, &synced_clock_callback);
-	sc_notify = &synced_clock_notify;
 	monomeFrameDirty++;
 	
 	// setup daisy chain for two dacs

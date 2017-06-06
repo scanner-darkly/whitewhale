@@ -38,8 +38,3 @@ void sc_save_config(synced_clock* sc, sc_config* conf);
 void sc_process_tap(synced_clock* sc, u64 tick);
 void sc_update_div(synced_clock* sc, u8 div);
 void sc_update_mult(synced_clock* sc, u8 mult);
-
-/////////////////
-
-sc_callback_t sc_notify;
-volatile u16 sc_debug1, sc_debug2;
