@@ -184,6 +184,7 @@ static void handler_Front(s32 data);
 static void handler_ClockNormal(s32 data);
 static void handler_ClockExt(s32 data);
 static void synced_clock_callback(void);
+static void synced_clock_notify(void);
 
 static void ww_process_ii(uint8_t *data, uint8_t l);
 
@@ -477,7 +478,8 @@ static softTimer_t monomePollTimer = { .next = NULL, .prev = NULL };
 static softTimer_t monomeRefreshTimer  = { .next = NULL, .prev = NULL };
 static softTimer_t synced_clock_off_timer = { .next = NULL, .prev = NULL };
 static softTimer_t synced_clock_off_timer2 = { .next = NULL, .prev = NULL };
-static softTimer_t synced_clock_off_timer3 = { .next = NULL, .prev = NULL };
+static softTimer_t clock_off_wwsync_timer = { .next = NULL, .prev = NULL };
+static softTimer_t sclock_notify_timer = { .next = NULL, .prev = NULL };
 
 
 static void clockTimer_callback(void* o) {  
@@ -732,7 +734,7 @@ static void handler_ClockExt(s32 data) {
 		sc_process_tap(&sclock, tcTicks);
 		sc_save_config(&sclock, &w.wp[pattern].sc_conf);
 	}
-	if (w.direct_clock) clock(data);
+	if (w.direct_clock && clock_enabled) clock(data);
 }
 
 static void synced_clock_off_callback(void* o) {
@@ -746,23 +748,38 @@ static void synced_clock_off_callback2(void* o) {
 	if (edit_mode == mClock) (*re)();
 }
 
-static void synced_clock_off_callback3(void* o) {
-	timer_remove(&synced_clock_off_timer3);
-	if (w.direct_clock) clock(0);
+static void clock_off_wwsync_callback(void* o) {
+	timer_remove(&clock_off_wwsync_timer);
+	clock(0);
 }
 
 static void synced_clock_callback(void) {
 	clock_on = 1;
 	if (edit_mode == mClock) (*re)();
-	timer_remove(&synced_clock_off_timer);
-	timer_add(&synced_clock_off_timer, 10, &synced_clock_off_callback, NULL);
 	timer_remove(&synced_clock_off_timer2);
 	timer_add(&synced_clock_off_timer2, 40, &synced_clock_off_callback2, NULL);
 
 	if (!clock_enabled || (w.direct_clock && clock_external)) return;
 	clock(1);
+	timer_remove(&synced_clock_off_timer);
+	timer_add(&synced_clock_off_timer, 10, &synced_clock_off_callback, NULL);
 }
 
+static void sclock_notify_callback(void* o) {
+	timer_remove(&sclock_notify_timer);
+	monomeLedBuffer[63] = 0;
+	monomeFrameDirty = 0b1111;
+}
+
+static void synced_clock_notify(void) {
+	for(u8 i1=0;i1<SIZE;i1++) {
+		monomeLedBuffer[i1+48] = sc_debug1 & (1 << i1) ? 4 : 0;
+		monomeLedBuffer[i1+64] = sc_debug2 & (1 << i1) ? 4 : 0;
+	}
+	monomeLedBuffer[63] = 4;
+	monomeFrameDirty = 0b1111;
+	timer_add(&sclock_notify_timer, 60, &sclock_notify_callback, NULL);
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////////////////////////////////////////////////////
@@ -1355,7 +1372,7 @@ static void refresh() {
 		monomeLedBuffer[i1] = 0;
 		monomeLedBuffer[16+i1] = 0;
 		monomeLedBuffer[32+i1] = 4;
-		monomeLedBuffer[48+i1] = 0;
+		//monomeLedBuffer[48+i1] = 0;
 	}
 
 	// dim mode
@@ -1625,8 +1642,8 @@ static void refresh() {
 	// clock settings
 	else if(edit_mode == mClock) {
 		for(i1=0;i1<SIZE;i1++) {
-			monomeLedBuffer[i1+48] = 0;
-			monomeLedBuffer[i1+64] = 0;
+			//monomeLedBuffer[i1+48] = 0;
+			//monomeLedBuffer[i1+64] = 0;
 			monomeLedBuffer[i1+80] = i1 < sclock.conf.div ? 11 : 2;
 			monomeLedBuffer[i1+96] = i1 < sclock.conf.mult ? 11 : 2;
 			monomeLedBuffer[i1+112] = 0;
@@ -1947,8 +1964,8 @@ static void ww_process_ii(uint8_t *data, uint8_t l) {
 			cut_pos++;
 			sc_process_tap(&sclock, tcTicks);
 			sc_save_config(&sclock, &w.wp[pattern].sc_conf);
-			if (w.direct_clock) {
-				timer_add(&synced_clock_off_timer3, 10, &synced_clock_off_callback3, NULL);
+			if (w.direct_clock && clock_enabled) {
+				timer_add(&clock_off_wwsync_timer, 10, &clock_off_wwsync_callback, NULL);
 				clock(1);
 			}
 			break;
@@ -2264,6 +2281,7 @@ int main(void)
 
 	clock_enabled = true;
 	sc_init(&sclock, &w.wp[pattern].sc_conf, &synced_clock_callback);
+	sc_notify = &synced_clock_notify;
 	monomeFrameDirty++;
 	
 	// setup daisy chain for two dacs

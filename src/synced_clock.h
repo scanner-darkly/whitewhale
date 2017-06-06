@@ -19,6 +19,7 @@ typedef volatile struct {
 	sc_callback_t callback;
 
 	u32 intervals[SC_MAXMULT];
+	u32 quarter;
 	u8 ext_index;
 	u8 int_index;
 
@@ -26,6 +27,7 @@ typedef volatile struct {
 	u8 ext_taps_index;
 	u8 ext_taps_count;
 	u64 last_tick;
+	u64 last_heartbeat;
 	
 	softTimer_t heartbeat;
 } synced_clock;
@@ -36,3 +38,8 @@ void sc_save_config(synced_clock* sc, sc_config* conf);
 void sc_process_tap(synced_clock* sc, u64 tick);
 void sc_update_div(synced_clock* sc, u8 div);
 void sc_update_mult(synced_clock* sc, u8 mult);
+
+/////////////////
+
+sc_callback_t sc_notify;
+volatile u16 sc_debug1, sc_debug2;
