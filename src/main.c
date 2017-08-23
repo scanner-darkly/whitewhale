@@ -30,6 +30,7 @@
 #include "util.h"
 #include "ftdi.h"
 #include "synced_clock.h"	
+#include "interrupts.h"
 
 // this
 #include "conf_board.h"
@@ -100,8 +101,6 @@ typedef struct {
 	u8 tr_mute[4];
 	u8 cv_mute[2];
 	u8 direct_clock;
-	u8 keep_tempo;
-	u8 keep_div_mult;
 	u8 reset_after_stop;
 } whale_set;
 
@@ -168,7 +167,7 @@ static void refresh(void);
 static void refresh_mono(void);
 static void refresh_preset(void);
 static void clock(u8 phase);
-static void update_synced_clock(u8 is_series, u8 is_synced);
+static void update_synced_clock(u8 is_synced);
 
 // start/stop monome polling/refresh timers
 extern void timers_set_monome(void);
@@ -210,10 +209,12 @@ void clock(u8 phase) {
 
 
 		if(pattern_jump) {
+			u8 irqs_flags = irqs_pause();
 			pattern = next_pattern;
+			update_synced_clock(true);
+			irqs_resume(irqs_flags);
 			next_pos = w.wp[pattern].loop_start;
 			pattern_jump = 0;
-			update_synced_clock(false, true);
 		}
 		// for series mode and delayed pattern change
 		if(series_jump) {
@@ -246,7 +247,11 @@ void clock(u8 phase) {
 				next_pattern = found[rnd()%count];
 			}
 
+			u8 irqs_flags = irqs_pause();
 			pattern = next_pattern;
+			update_synced_clock(true);
+			irqs_resume(irqs_flags);
+			
 			series_playing = pattern;
 			if(w.wp[pattern].step_mode == mReverse)
 				next_pos = w.wp[pattern].loop_end;
@@ -255,7 +260,6 @@ void clock(u8 phase) {
 
 			series_jump = 0;
 			series_step = 0;
-			update_synced_clock(true, true);
 		}
 
 		pos = next_pos;
@@ -459,13 +463,16 @@ void clock(u8 phase) {
 	// print_dbg_ulong(pos);
 }
 
-void update_synced_clock(u8 is_series, u8 is_synced) {
-	if (is_series)
-		sc_load_config(&sclock, &w.wp[pattern].sc_conf, !w.keep_tempo, !w.keep_div_mult, is_synced);
-	else
-		sc_load_config(&sclock, &w.wp[pattern].sc_conf, true, true, is_synced);
+static softTimer_t debug_timer = { .next = NULL, .prev = NULL };
+
+static void debug_callback(void* o) {
+	timer_remove(&debug_timer);
 }
 
+void update_synced_clock(u8 is_synced) {
+	sc_load_config(&sclock, &w.wp[pattern].sc_conf, is_synced);
+	timer_add(&debug_timer, 30, &debug_callback, NULL);
+}
 
 ////////////////////////////////////////////////////////////////////////////////
 // timers
@@ -486,8 +493,10 @@ static void clockTimer_callback(void* o) {
 	// e.data = 0;
 	// event_post(&e);
 	if(clock_external == 0) {
+        // using local variable because pattern can change from timer interrupt
+        u8 pat = pattern;
 		sc_process_tap(&sclock, tcTicks);
-		sc_save_config(&sclock, &w.wp[pattern].sc_conf);
+		sc_save_config(&sclock, &w.wp[pat].sc_conf);
 	}
 }
 
@@ -697,9 +706,12 @@ static void handler_KeyTimer(s32 data) {
 					w.wp[x].tr_mode = w.wp[pattern].tr_mode;
 					w.wp[x].step_mode = w.wp[pattern].step_mode;
 
+					u8 irqs_flags = irqs_pause();
 					pattern = x;
+					update_synced_clock(false);
+					irqs_resume(irqs_flags);
+
 					next_pattern = x;
-					update_synced_clock(false, false);
 					monomeFrameDirty++;
 
 					// print_dbg("\r\n saved pattern: ");
@@ -727,12 +739,23 @@ static void handler_ClockNormal(s32 data) {
 	clock_external = !gpio_get_pin_value(B09); 
 }
 
+static void clock_off_wwsync_callback(void* o) {
+	timer_remove(&clock_off_wwsync_timer);
+	//clock(0);
+}
+
 static void handler_ClockExt(s32 data) {
 	if (data) {
+        // using local variable because pattern can change from timer interrupt
+        u8 pat = pattern;
 		sc_process_tap(&sclock, tcTicks);
-		sc_save_config(&sclock, &w.wp[pattern].sc_conf);
+		sc_save_config(&sclock, &w.wp[pat].sc_conf);
 	}
 	if (w.direct_clock && clock_enabled) clock(data);
+	
+	if (data) {
+		timer_add(&clock_off_wwsync_timer, 30, &clock_off_wwsync_callback, NULL);
+	}
 }
 
 static void synced_clock_off_callback(void* o) {
@@ -744,11 +767,6 @@ static void synced_clock_off_callback2(void* o) {
 	timer_remove(&synced_clock_off_timer2);
 	clock_on = 0;
 	if (edit_mode == mClock) (*re)();
-}
-
-static void clock_off_wwsync_callback(void* o) {
-	timer_remove(&clock_off_wwsync_timer);
-	clock(0);
 }
 
 static void synced_clock_callback(void) {
@@ -804,9 +822,11 @@ static void handler_MonomeGridKey(s32 data) {
 					if(key_alt)
 						next_pattern = i1;
 					else {
+						u8 irqs_flags = irqs_pause();
 						pattern = i1;
+						update_synced_clock(false);
 						next_pattern = i1;
-						update_synced_clock(false, false);
+						irqs_resume(irqs_flags);
 					}
 				}
 			}
@@ -920,7 +940,7 @@ static void handler_MonomeGridKey(s32 data) {
 					param_accept = 0;
 					live_in = 0;
 				} else if (key_meta) {
-					if (edit_mode == mSeries) update_synced_clock(false, false);
+					if (edit_mode == mSeries) update_synced_clock(false);
 					edit_mode = mClock;
 				}
 				monomeFrameDirty++;
@@ -931,7 +951,7 @@ static void handler_MonomeGridKey(s32 data) {
 				else if(key_meta)
 					w.tr_mute[x] ^= 1;
 				else {
-					if (edit_mode == mSeries) update_synced_clock(false, false);
+					if (edit_mode == mSeries) update_synced_clock(false);
 					edit_mode = mTrig;
 				}
 				edit_prob = 0;
@@ -948,7 +968,7 @@ static void handler_MonomeGridKey(s32 data) {
 				else if(key_meta)
 					w.cv_mute[edit_cv_ch] ^= 1;
 				else {
-					if (edit_mode == mSeries) update_synced_clock(false, false);
+					if (edit_mode == mSeries) update_synced_clock(false);
 					edit_mode = mMap;
 				}
 
@@ -957,7 +977,7 @@ static void handler_MonomeGridKey(s32 data) {
 			else if(SIZE==8 && (x == 4 || x == 5) && z) {
 				param_accept = 0;
 				edit_cv_ch = x-4;
-				if (edit_mode == mSeries) update_synced_clock(false, false);
+				if (edit_mode == mSeries) update_synced_clock(false);
 				edit_mode = mMap;
 				edit_prob = 0;
 
@@ -976,13 +996,19 @@ static void handler_MonomeGridKey(s32 data) {
 				key_meta = z;
 			}
 			else if(x == LENGTH-2 && z) {
-				if (edit_mode == mSeries) update_synced_clock(false, false);
+				if (edit_mode == mSeries) update_synced_clock(false);
 				edit_mode = mClock;
 				monomeFrameDirty++;
 			}
 			else if(x == LENGTH-3 && z) {
 				clock_enabled = !clock_enabled;
-				if (clock_enabled && w.reset_after_stop) next_pos = w.wp[pattern].loop_start;
+				if (clock_enabled && w.reset_after_stop) {
+					series_step = 0;
+					if(w.wp[pattern].step_mode == mReverse)
+						next_pos = w.wp[pattern].loop_end;
+					else
+						next_pos = w.wp[pattern].loop_start;
+				}
 				monomeFrameDirty++;
 			}
 		}
@@ -1322,10 +1348,6 @@ static void handler_MonomeGridKey(s32 data) {
 					break;
 				case 7:
 					if (x == 0) {
-						w.keep_tempo = !w.keep_tempo;
-					} else if (x == 1) {
-						w.keep_div_mult = !w.keep_div_mult;
-					} else if (x == 2) {
 						w.reset_after_stop = !w.reset_after_stop;
 					} else if (x == LENGTH-2) {
 						sc_process_tap(&sclock, tcTicks);
@@ -1334,7 +1356,13 @@ static void handler_MonomeGridKey(s32 data) {
 						w.direct_clock = !w.direct_clock;
 					} else if (x == LENGTH) {
 						clock_enabled = !clock_enabled;
-						if (clock_enabled && w.reset_after_stop) next_pos = w.wp[pattern].loop_start;
+						if (clock_enabled && w.reset_after_stop) {
+							series_step = 0;
+							if(w.wp[pattern].step_mode == mReverse)
+								next_pos = w.wp[pattern].loop_end;
+							else
+								next_pos = w.wp[pattern].loop_start;
+						}
 					}
 					break;
 			}
@@ -1630,9 +1658,7 @@ static void refresh() {
 			monomeLedBuffer[i1+96] = i1 < sclock.conf.mult ? 11 : 2;
 			monomeLedBuffer[i1+112] = 0;
 		}
-		monomeLedBuffer[112] = w.keep_tempo ? 11 : 4;
-		monomeLedBuffer[113] = w.keep_div_mult ? 11 : 4;
-		monomeLedBuffer[114] = w.reset_after_stop ? 11 : 4;
+		monomeLedBuffer[112] = w.reset_after_stop ? 11 : 4;
 		monomeLedBuffer[110+LENGTH] = clock_on ? 11 : 4;
 		monomeLedBuffer[111+LENGTH] = w.direct_clock ? 11 : 4;
 		monomeLedBuffer[112+LENGTH] = clock_enabled ? 11 : 4;
@@ -1879,9 +1905,7 @@ static void refresh_mono() {
 			monomeLedBuffer[i1+96] = i1 < sclock.conf.mult ? 11 : 2;
 			monomeLedBuffer[i1+112] = 0;
 		}
-		monomeLedBuffer[112] = w.keep_tempo ? 11 : 4;
-		monomeLedBuffer[113] = w.keep_div_mult ? 11 : 4;
-		monomeLedBuffer[114] = w.reset_after_stop ? 11 : 4;
+		monomeLedBuffer[112] = w.reset_after_stop ? 11 : 4;
 		monomeLedBuffer[110+LENGTH] = clock_on ? 11 : 4;
 		monomeLedBuffer[111+LENGTH] = w.direct_clock ? 11 : 4;
 		monomeLedBuffer[112+LENGTH] = clock_enabled ? 11 : 4;
@@ -1944,8 +1968,10 @@ static void ww_process_ii(uint8_t *data, uint8_t l) {
 				break;
 			next_pos = d;
 			cut_pos++;
+            // using local variable because pattern can change from timer interrupt
+            u8 pat = pattern;
 			sc_process_tap(&sclock, tcTicks);
-			sc_save_config(&sclock, &w.wp[pattern].sc_conf);
+			sc_save_config(&sclock, &w.wp[pat].sc_conf);
 			if (w.direct_clock && clock_enabled) {
 				timer_add(&clock_off_wwsync_timer, 10, &clock_off_wwsync_callback, NULL);
 				clock(1);
@@ -1989,7 +2015,7 @@ static void ww_process_ii(uint8_t *data, uint8_t l) {
 				break;
  			pattern = d;
 			next_pattern = d;
-			update_synced_clock(edit_mode == mSeries, false);
+			update_synced_clock(false);
 			monomeFrameDirty++;
  			break;
  		case WW_QPATTERN:
@@ -2127,8 +2153,6 @@ void flash_read(void) {
 	w.cv_mute[1] = flashy.w[preset_select].cv_mute[1];
 	
 	w.direct_clock = flashy.w[preset_select].direct_clock;
-	w.keep_tempo = flashy.w[preset_select].keep_tempo;
-	w.keep_div_mult = flashy.w[preset_select].keep_div_mult;
 	w.reset_after_stop = flashy.w[preset_select].reset_after_stop;
 
 	for(i1=0;i1<64;i1++)
@@ -2223,8 +2247,6 @@ int main(void)
 		w.cv_mute[1] = 1;
 
 		w.direct_clock = false;
-		w.keep_tempo = false;
-		w.keep_div_mult = false;
 		w.reset_after_stop = false;
 		
 		for(i1=0;i1<64;i1++)

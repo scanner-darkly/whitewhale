@@ -1,3 +1,5 @@
+#include "print_funcs.h"
+
 #include "synced_clock.h"
 #include "compiler.h"
 #include "init_trilogy.h"
@@ -8,23 +10,15 @@ static void sc_update_period(synced_clock* sc, u32 tap);
 static void sc_recalculate_intervals(synced_clock* sc);
 static void sc_adjust_position(synced_clock* sc, u32 position);
 static u32 sc_get_position(synced_clock* sc);
+static void sc_update_conf(synced_clock* sc);
 
 static void sc_heartbeat_callback(void* o) {
 	synced_clock* sc = o;
-	
-	u8 irq_flags = irqs_pause();
-	
-	if ((get_ticks() - sc->last_heartbeat) < sc->quarter) {
-		irqs_resume(irq_flags);
-		return;
-	}
-	
-	sc->last_heartbeat = get_ticks();
+	if ((get_ticks() - sc->last_heartbeat) < sc->quarter) return;
+
+    sc->last_heartbeat = get_ticks();
 	if (++sc->int_index >= sc->conf.mult) sc->int_index = 0;
 	timer_reset_set(&sc->heartbeat, sc->intervals[sc->int_index]);
-	
-	irqs_resume(irq_flags);
-
 	(*(sc->callback))();
 }
 
@@ -59,6 +53,8 @@ static void sc_recalculate_intervals(synced_clock* sc) {
 }
 
 static void sc_adjust_position(synced_clock* sc, u32 position) {
+    sc->heartbeat.ticksRemain = sc->heartbeat.ticks;
+
 	u32 delta = position;
 	u8 expected_index = 0;
 	while (delta >= sc->intervals[expected_index] && expected_index < sc->conf.mult) {
@@ -72,7 +68,6 @@ static void sc_adjust_position(synced_clock* sc, u32 position) {
 	u32 remaining = sc->intervals[expected_index] - delta;
 	if (!remaining) remaining = 1;
 
-	u8 irq_flags = irqs_pause();
 	u32 since_last = get_ticks() - sc->last_heartbeat;
 	if (remaining <= 1) {
 		if (since_last < sc->quarter) {
@@ -97,46 +92,79 @@ static void sc_adjust_position(synced_clock* sc, u32 position) {
 		sc->heartbeat.ticks = sc->intervals[sc->int_index];
 		sc->heartbeat.ticksRemain = remaining;
 	}
-	irqs_resume(irq_flags);
 }
 	
 static u32 sc_get_position(synced_clock* sc) {
 	u32 position = 0;
-	u8 irq_flags = irqs_pause();
 	for (u8 i = 0; i < sc->int_index; i++) position += sc->intervals[i];
 	position += sc->heartbeat.ticks - sc->heartbeat.ticksRemain;
-	irqs_resume(irq_flags);
 	return position;
 }
 
+static void sc_update_conf(synced_clock* sc) {
+    print_dbg("update_conf [\r\n");
+  	u32 pos = sc_get_position(sc);
+	sc->conf.div = sc->new_conf.div ? sc->new_conf.div : 1;
+	sc->conf.mult = sc->new_conf.mult ? sc->new_conf.mult : 1;
+	if (sc->conf.mult > SC_MAXMULT) sc->conf.mult = SC_MAXMULT;
+    if (sc->int_index >= sc->conf.mult) sc->int_index = 0;
+	sc->conf.period = sc->new_conf.period;
+	sc->ext_taps_index = sc->ext_taps_count = 0;
+	sc->ext_index = sc->int_index = 0;
+	sc_recalculate_intervals(sc);
+	sc_adjust_position(sc, pos);
+    sc->update_conf = 0;
+    print_dbg("update_conf ]\r\n");
+}
+
+// public methods
+
 void sc_process_tap(synced_clock* sc, u64 tick) {
+    print_dbg("process_tap [\r\n");
 	u64 elapsed = tick - sc->last_tick;
 	sc->last_tick = tick;
+    if (sc->in_update) {
+        print_dbg("process_tap -\r\n");
+        return;
+    }
 	if (elapsed > (u32)60000) {
-		sc->ext_index = 0;
+		sc->ext_index = sc->ext_taps_index = sc->ext_taps_count = 0;
+        print_dbg("process_tap --\r\n");
 		return;
 	}
-	
+    
+    sc->in_update = 1;
 	if (++sc->ext_index >= sc->conf.div) sc->ext_index = 0;
 	sc_update_period(sc, elapsed);
 	sc_recalculate_intervals(sc);
 	sc_adjust_position(sc, sc->conf.period * sc->ext_index);
+    if (sc->update_conf) sc_update_conf(sc);
+    sc->in_update = 0;
+    print_dbg("process_tap ]\r\n");
 }
 
 void sc_update_div(synced_clock* sc, u8 div) {
-	u32 pos = sc_get_position(sc);
-	sc->conf.div = div ? div : 1;
-	sc_recalculate_intervals(sc);
-	sc_adjust_position(sc, pos);
+    sc->update_conf = 1;
+    sc->new_conf.div = div;
+    sc->new_conf.mult = sc->conf.mult;
+    sc->new_conf.period = sc->conf.period;
+
+    if (sc->in_update) return;
+    sc->in_update = 1;
+    sc_update_conf(sc);
+    sc->in_update = 0;
 }
 
 void sc_update_mult(synced_clock* sc, u8 mult) {
-	u32 pos = sc_get_position(sc);
-	sc->conf.mult = mult ? mult : 1;
-	if (sc->conf.mult > SC_MAXMULT) sc->conf.mult = SC_MAXMULT;
-	if (sc->int_index >= sc->conf.mult) sc->int_index = 0;
-	sc_recalculate_intervals(sc);
-	sc_adjust_position(sc, pos);
+    sc->update_conf = 1;
+    sc->new_conf.div = sc->conf.div;
+    sc->new_conf.mult = mult;
+    sc->new_conf.period = sc->conf.period;
+
+    if (sc->in_update) return;
+    sc->in_update = 1;
+    sc_update_conf(sc);
+    sc->in_update = 0;
 }
 
 void sc_init(synced_clock* sc, sc_config* conf, sc_callback_t callback) {
@@ -145,6 +173,9 @@ void sc_init(synced_clock* sc, sc_config* conf, sc_callback_t callback) {
 	sc->conf.period = conf->period;
 	sc->callback = callback;
 
+    sc->in_update = 0;
+    sc->update_conf = 0;
+    
 	sc->ext_index = 0;
 	sc->int_index = 0;
 	sc_recalculate_intervals(sc);
@@ -159,29 +190,24 @@ void sc_init(synced_clock* sc, sc_config* conf, sc_callback_t callback) {
 	sc_heartbeat_callback((void *)sc);
 }
 
-void sc_load_config(synced_clock* sc, sc_config* conf, u8 update_period, u8 update_div_mult, u8 from_clock) {
-	u32 pos = from_clock ? 0 : sc_get_position(sc);
-	if (update_div_mult) {
-		sc->conf.div = conf->div ? conf->div : 1;
-		sc->conf.mult = conf->mult ? conf->mult : 1;
-		if (sc->conf.mult > SC_MAXMULT) sc->conf.mult = SC_MAXMULT;
-	}
-	if (update_period) {
-		sc->conf.period = conf->period;
-		sc->ext_taps_index = sc->ext_taps_count = 0;
-	}
-	if (update_div_mult || update_period) {
-		sc->ext_index = sc->int_index = 0;
-		sc_recalculate_intervals(sc);
-		if (from_clock)
-			timer_reset_set(&sc->heartbeat, sc->intervals[sc->int_index]);
-		else
-			sc_adjust_position(sc, pos);
-	}
+void sc_load_config(synced_clock* sc, sc_config* conf, u8 from_clock) {
+    print_dbg("load_config [\r\n");
+    sc->update_conf = 1;
+    sc->new_conf.div = conf->div;
+    sc->new_conf.mult = conf->mult;
+    sc->new_conf.period = conf->period;
+
+    if (sc->in_update) return;
+    sc->in_update = 1;
+    sc_update_conf(sc);
+    sc->in_update = 0;
+    print_dbg("load_config ]\r\n");
 }
 
 void sc_save_config(synced_clock* sc, sc_config* conf) {
+    print_dbg("save_config [\r\n");
 	conf->div = sc->conf.div;
 	conf->mult = sc->conf.mult;
 	conf->period = sc->conf.period;
+    print_dbg("save_config ]\r\n");
 }
