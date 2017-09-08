@@ -1,44 +1,54 @@
 #pragma once
 
-#define SC_MAXMULT 16
-#define SC_AVERAGING_TAPS 3
-
 #include "types.h"
 #include "timers.h"
 
-typedef volatile struct {
-	u8 div;
-	u8 mult;
-	u32 period;
-} sc_config;
+#define SC_MAXMULT 16
+#define SC_AVERAGING_TAPS 2
 
 typedef void (*sc_callback_t)(void);
 
 typedef volatile struct {
-	sc_config conf;
-	sc_callback_t callback;
+    softTimer_t heartbeat;
+    sc_callback_t callback;
+    u32 intervals[SC_MAXMULT];
+    u8 interval;
+    u32 quarter;
+    u64 last_heartbeat;
+} sc_clock;
 
-	u8 in_update;
-    u8 update_conf;
-    sc_config new_conf;
+typedef volatile struct {
+    u32 taps[SC_AVERAGING_TAPS];
+    u32 last_tap;
+    u32 quarter;
+    u8 index;
+    u8 count;
+    u64 last_tick;
+} sc_taps;
 
-	u32 intervals[SC_MAXMULT];
-	u32 quarter;
-	u8 ext_index;
-	u8 int_index;
+typedef volatile struct {
+    u32 period;
+    u8 div;
+    u8 mult;
+    u8 phase_lock;
 
-	u32 ext_taps[SC_AVERAGING_TAPS];
-	u8 ext_taps_index;
-	u8 ext_taps_count;
-	u64 last_tick;
-	u64 last_heartbeat;
-	
-	softTimer_t heartbeat;
+    sc_clock clock;
+    sc_taps taps;
+    
+    u8 div_index;
+    u32 phase_offset;
+    
+    u32 new_period;
+    u8 new_div;
+    u8 new_mult;
+    softTimer_t changes_from_first_tap;
+    softTimer_t changes_from_clock;
+    softTimer_t changes_from_config;
 } synced_clock;
 
-void sc_init(synced_clock* sc, sc_config* conf, sc_callback_t callback);
-void sc_load_config(synced_clock* sc, sc_config* conf, u8 from_clock);
-void sc_save_config(synced_clock* sc, sc_config* conf);
-void sc_process_tap(synced_clock* sc, u64 tick);
-void sc_update_div(synced_clock* sc, u8 div);
-void sc_update_mult(synced_clock* sc, u8 mult);
+void sc_init(synced_clock* sc, u8 div, u8 mult, u32 period, u8 phase_lock, sc_callback_t callback);
+void sc_start(synced_clock* sc);
+void sc_stop(synced_clock* sc);
+u32 sc_process_clock(synced_clock* sc, u8 use_average);
+void sc_update_divmult(synced_clock* sc, u8 div, u8 mult, u8 from_timer);
+void sc_set_lock_mode(synced_clock* sc, u8 phase_lock);
